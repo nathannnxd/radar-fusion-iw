@@ -1,13 +1,13 @@
 # =====================================================================
-#  IWR1642 → точки → (модель или правило) → кластеры → треки → контракт /radar/tracks
-#  Самостоятельный скрипт для ноутбука у радара. Не для Colab (там нет COM).
-#  Без радара: DUMP_FILE = "radar_dump.bin" — прогонит запись.
+#  IWR1642 → points → (model or rule) → clusters → tracks → /radar/tracks contract
+#  Standalone script for the laptop next to the radar. Not for Colab (no COM there).
+#  Without a radar: DUMP_FILE = "radar_dump.bin" — replays a recording.
 #
-#  Конвейер одного кадра:
-#    байты → parse_frame → points_to_detections (r, az, v, snr; отсечка утечки; компенсация ego)
-#          → background.mark (карта фона, только когда радар стоит)
-#          → predict_points (LightGBM по точкам или правило)
-#          → cluster_objects (DBSCAN в x, y, v) → Tracker.step (EKF: x, y, vr) → контракт
+#  Single-frame pipeline:
+#    bytes → parse_frame → points_to_detections (r, az, v, snr; leakage cutoff; ego compensation)
+#          → background.mark (background map, only while the radar is stationary)
+#          → predict_points (LightGBM over points, or a rule)
+#          → cluster_objects (DBSCAN over x, y, v) → Tracker.step (EKF: x, y, vr) → contract
 # =====================================================================
 import json
 import math
@@ -36,41 +36,41 @@ try:
 except ImportError:
     DBSCAN = None
 
-# ---------------------------------------------------------------- НАСТРОЙКИ
+# ---------------------------------------------------------------- SETTINGS
 CLI_PORT = "COM5"          # XDS110 Class Application/User UART
 DATA_PORT = "COM6"         # XDS110 Class Auxiliary Data Port
 CFG_FILE = "profile_sdk3.cfg"
-MODEL_PATH = "radar_lightgbm_model.pkl"   # свой .pkl; путь /content/drive/... на ноутбуке не существует
-DUMP_FILE = None           # "radar_dump.bin" — прогон записи без портов
-SEND_CFG = True            # False, если радар уже стримит (например, запущен из Visualizer)
-EGO_SPEED_MPS = 0.0        # скорость носителя, м/с; на стенде 0, на тракторе — с одометрии
-SHOW_WINDOW = True         # окно OpenCV
-DRAW_METERS = 15           # радиус картинки, м: 10 для комнаты, 30–50 для поля
-LOG_JSONL = True           # писать кадры и треки в frames_<время>.jsonl
+MODEL_PATH = "radar_lightgbm_model.pkl"   # our own .pkl; the /content/drive/... path doesn't exist on the laptop
+DUMP_FILE = None           # "radar_dump.bin" — replay a recording without ports
+SEND_CFG = True            # False if the radar is already streaming (e.g. started from Visualizer)
+EGO_SPEED_MPS = 0.0        # carrier speed, m/s; 0 on the bench, from odometry on the tractor
+SHOW_WINDOW = True         # OpenCV window
+DRAW_METERS = 15           # image radius, m: 10 for a room, 30–50 for a field
+LOG_JSONL = True           # write frames and tracks to frames_<time>.jsonl
 
-MIN_RANGE_M = 0.5          # ближе — утечка антенн / корпус (в обоих дампах точка 0–0,5 м с SNR 27 дБ)
-STATIC_DOPPLER_MPS = 0.12  # |Доплер после компенсации ego| меньше этого — точка неподвижна
-USE_BACKGROUND = True      # карта фона: учится первые BACKGROUND_LEARN_S секунд, только пока ego ≈ 0
+MIN_RANGE_M = 0.5          # closer than this — antenna leakage / housing (in both dumps a point at 0–0.5 m with SNR 27 dB)
+STATIC_DOPPLER_MPS = 0.12  # |Doppler after ego compensation| below this — the point is stationary
+USE_BACKGROUND = True      # background map: learns for the first BACKGROUND_LEARN_S seconds, only while ego ≈ 0
 BACKGROUND_LEARN_S = 3.0
 BACKGROUND_CELL_M = 0.25
-BACKGROUND_MIN_OCCUPANCY = 0.4   # клетка — фон, если занята статичной точкой в ≥40 % кадров обучения
-CLUSTER_EPS_M = 0.7        # радиус кластера в (x, y, v·CLUSTER_V_WEIGHT)
-CLUSTER_V_WEIGHT = 0.7     # 1 м/с разницы скорости ≈ 0,7 м расстояния → разные объекты
-TRACK_CONFIRM_HITS = 3     # попаданий, чтобы кандидат стал треком
-TRACK_CONFIRM_WINDOW = 5   # ...за столько первых кадров
-TRACK_MAX_MISSES = 10      # кадров без измерения трек живёт по предсказанию (1 с при 10 Гц)
+BACKGROUND_MIN_OCCUPANCY = 0.4   # a cell is background if occupied by a static point in ≥40 % of the learning frames
+CLUSTER_EPS_M = 0.7        # cluster radius in (x, y, v·CLUSTER_V_WEIGHT)
+CLUSTER_V_WEIGHT = 0.7     # 1 m/s of speed difference ≈ 0.7 m of distance → different objects
+TRACK_CONFIRM_HITS = 3     # hits needed for a candidate to become a track
+TRACK_CONFIRM_WINDOW = 5   # ...within this many first frames
+TRACK_MAX_MISSES = 10      # frames without a measurement a track survives on prediction (1 s at 10 Hz)
 
 MAGIC = b"\x02\x01\x04\x03\x06\x05\x08\x07"
 HEADER_LEN = 40
 TLV_DETECTED_POINTS, TLV_RANGE_PROFILE, TLV_NOISE_PROFILE, TLV_STATS, TLV_SIDE_INFO, TLV_TEMP = 1, 2, 3, 6, 7, 9
 
-# Признаки строго в порядке обучения (train DataFrame.drop(columns=['target_kind']))
+# Features in the exact training order (train DataFrame.drop(columns=['target_kind']))
 EXPECTED_FEATURES = [
     "ego_speed_mps", "ego_moving", "range_m", "azimuth_rad", "azimuth_deg",
     "doppler_mps", "snr_db", "x_m", "y_m", "range_bin", "doppler_bin",
     "azimuth_bin", "doppler_aliased",
 ]
-# Классы модели — ТИПЫ ТОЧЕК, не объекты. Человек/машина радар не различает.
+# Model classes are POINT TYPES, not objects. The radar doesn't distinguish person/vehicle.
 POINT_CLASS_COLOR = {          # BGR
     "target": (0, 220, 0), "target_micro": (0, 160, 255), "clutter": (128, 128, 128),
     "false_alarm": (60, 60, 60), "ghost": (255, 0, 255), "background": (70, 70, 110),
@@ -78,9 +78,9 @@ POINT_CLASS_COLOR = {          # BGR
 TARGET_CLASSES = {"target", "target_micro"}
 
 
-# ---------------------------------------------------------------- .cfg → параметры
+# ---------------------------------------------------------------- .cfg → parameters
 def parse_cfg(path):
-    """Разрешение по дальности/скорости, максимум скорости, период кадра — из .cfg."""
+    """Range/speed resolution, max speed, frame period — from .cfg."""
     res = {"range_res_m": None, "doppler_res_mps": None, "num_doppler_bins": None, "num_range_bins": None,
            "max_doppler_mps": None, "doppler_period_mps": None, "frame_period_s": None, "max_range_m": None}
     profile = frame = None
@@ -106,19 +106,19 @@ def parse_cfg(path):
         res["range_res_m"] = c / (2 * bw)
         res["num_range_bins"] = int(2 ** math.ceil(math.log2(num_adc)))
         res["max_range_m"] = res["range_res_m"] * res["num_range_bins"] * 0.8
-        lam = c / (start_freq_ghz * 1e9 + bw / 2)                 # длина волны на центральной частоте
+        lam = c / (start_freq_ghz * 1e9 + bw / 2)                 # wavelength at the center frequency
         tc = (idle_us + ramp_end_us) * 1e-6 * n_chirps
         res["num_doppler_bins"] = num_loops
         res["doppler_res_mps"] = lam / (2 * num_loops * tc)
         res["max_doppler_mps"] = lam / (4 * tc)
-        res["doppler_period_mps"] = 2 * res["max_doppler_mps"]     # период неоднозначности скорости
+        res["doppler_period_mps"] = 2 * res["max_doppler_mps"]     # speed ambiguity period
         res["frame_period_s"] = frame[4] / 1000.0
     return res
 
 
-# ---------------------------------------------------------------- разбор кадра TI
+# ---------------------------------------------------------------- TI frame parsing
 def parse_frame(packet):
-    """Один пакет OOB-демо (SDK 2.x / 3.x) → dict: points, side (snr, noise), range_profile_db."""
+    """One OOB-demo packet (SDK 2.x / 3.x) → dict: points, side (snr, noise), range_profile_db."""
     if len(packet) < HEADER_LEN or packet[:8] != MAGIC:
         return None
     version, total_len, platform, frame_num, cpu_cycles, num_obj, num_tlv, subframe = \
@@ -134,10 +134,10 @@ def parse_frame(packet):
         body = packet[off + 8: off + 8 + tlv_len]
         off += 8 + tlv_len
         if tlv_type == TLV_DETECTED_POINTS:
-            if sdk_major >= 3:                    # 4 float: x, y, z (м), v (м/с)
+            if sdk_major >= 3:                    # 4 floats: x, y, z (m), v (m/s)
                 for i in range(len(body) // 16):
                     frame["points"].append(list(struct.unpack_from("<4f", body, i * 16)))
-            else:                                 # numObj, xyzQFormat, затем rangeIdx dopplerIdx peakVal x y z
+            else:                                 # numObj, xyzQFormat, then rangeIdx dopplerIdx peakVal x y z
                 n, qfmt = struct.unpack_from("<2H", body, 0)
                 sc = 1.0 / (1 << qfmt)
                 for i in range(n):
@@ -146,16 +146,16 @@ def parse_frame(packet):
         elif tlv_type == TLV_SIDE_INFO:
             for i in range(len(body) // 4):
                 snr, noise = struct.unpack_from("<2h", body, i * 4)
-                frame["side"].append((snr * 0.1, noise * 0.1))       # единицы 0,1 дБ
+                frame["side"].append((snr * 0.1, noise * 0.1))       # units of 0.1 dB
         elif tlv_type == TLV_RANGE_PROFILE:
-            # uint16 на бин, log2-магнитуда в Q9 → дБ = val / 512 · 20·log10(2)
+            # uint16 per bin, log2 magnitude in Q9 → dB = val / 512 · 20·log10(2)
             prof = np.frombuffer(body[: (len(body) // 2) * 2], dtype="<u2").astype(np.float32)
             frame["range_profile_db"] = prof * (20 * math.log10(2) / 512)
     return frame
 
 
 def frames_from_bytes(buffer):
-    """Генератор кадров из байтового буфера; return-значение — необработанный остаток."""
+    """Generator of frames from a byte buffer; the return value is the unprocessed remainder."""
     while True:
         idx = buffer.find(MAGIC)
         if idx < 0:
@@ -174,8 +174,8 @@ def frames_from_bytes(buffer):
 
 
 def noise_floor(frame, cfg):
-    """Шумовая полка по Range Profile: ближняя зона (0,5–3 м) и дальняя (медиана). Прокси пыли:
-    шлейф за орудием поднимает ближнюю полку раньше, чем появляются точки."""
+    """Noise floor from the Range Profile: near zone (0.5–3 m) and far (median). Dust proxy:
+    a plume behind the implement raises the near floor before points appear."""
     prof = frame.get("range_profile_db")
     if prof is None or len(prof) < 16:
         return None
@@ -186,14 +186,14 @@ def noise_floor(frame, cfg):
     return {"near_db": near, "far_db": far, "near_excess_db": near - far}
 
 
-# ---------------------------------------------------------------- точки → признаки
+# ---------------------------------------------------------------- points → features
 def points_to_detections(frame, cfg, ego_speed):
-    """Точки кадра → список dict (формат train-JSON + служебные поля).
+    """Frame points → list of dicts (train-JSON format + internal fields).
 
-    doppler_mps      — как измерил радар (в системе радара; + = удаляется);
-    doppler_rel_mps  — после компенсации движения носителя: для неподвижного объекта ≈ 0.
-                       Неподвижный объект с радара, едущего вперёд со скоростью ego, виден
-                       с Доплером −ego·cos(азимут); вычитаем его.
+    doppler_mps      — as measured by the radar (in the radar frame; + = receding);
+    doppler_rel_mps  — after compensating for carrier motion: ≈ 0 for a stationary object.
+                       A stationary object seen from a radar moving forward at speed ego appears
+                       with Doppler −ego·cos(azimuth); we subtract it.
     is_static        — |doppler_rel| < STATIC_DOPPLER_MPS.
     """
     dets = []
@@ -205,7 +205,7 @@ def points_to_detections(frame, cfg, ego_speed):
         rng = math.sqrt(x * x + y * y + z * z)
         if rng < MIN_RANGE_M:
             continue
-        az = math.atan2(x, y)                         # TI: y — вперёд, x — вправо
+        az = math.atan2(x, y)                         # TI: y — forward, x — right
         if frame["sdk_major"] >= 3:
             v = p[3]
             snr = frame["side"][i][0] if i < len(frame["side"]) else float("nan")
@@ -228,18 +228,18 @@ def points_to_detections(frame, cfg, ego_speed):
     return dets
 
 
-# ---------------------------------------------------------------- карта фона
+# ---------------------------------------------------------------- background map
 class BackgroundMap:
-    """Сетка занятости для неподвижного радара. Учится первые learn_s секунд: клетка, где статичная
-    точка была в ≥ min_occ доле кадров, — фон. Дальше статичные точки в таких клетках помечаются
-    background=True и не идут в кластеры. При ego ≠ 0 отключена (фон едет вместе с картинкой)."""
+    """Occupancy grid for a stationary radar. Learns for the first learn_s seconds: a cell where a static
+    point was present in ≥ min_occ of frames is background. After that, static points in such cells are
+    marked background=True and excluded from clustering. Disabled when ego ≠ 0 (the background moves with the view)."""
 
     def __init__(self, cell=0.25, learn_s=3.0, min_occ=0.6, x_lim=20.0, y_lim=50.0):
         self.cell, self.learn_s, self.min_occ = cell, learn_s, min_occ
         self.nx, self.ny = int(2 * x_lim / cell), int(y_lim / cell)
         self.counts = np.zeros((self.nx, self.ny), dtype=np.int32)
         self.frames_seen, self.t_start = 0, None
-        self.mask = None                                     # None = ещё учимся
+        self.mask = None                                     # None = still learning
 
     def _cell(self, d):
         ix = int((d["x_m"] + self.nx * self.cell / 2) / self.cell)
@@ -251,7 +251,7 @@ class BackgroundMap:
         return self.mask is None
 
     def mark(self, dets, t, ego_speed):
-        if abs(ego_speed) > 0.1:                           # носитель едет — карта не имеет смысла
+        if abs(ego_speed) > 0.1:                           # carrier is moving — the map is meaningless
             return dets
         if self.t_start is None:
             self.t_start = t
@@ -263,7 +263,7 @@ class BackgroundMap:
                     self.counts[c] += 1
             if t - self.t_start >= self.learn_s and self.frames_seen >= 10:
                 core = self.counts >= self.min_occ * self.frames_seen
-                # расширить на соседние клетки: отражение дрожит на ±1 клетку от кадра к кадру
+                # expand to neighboring cells: the reflection jitters by ±1 cell from frame to frame
                 mask = core.copy()
                 for dx in (-1, 0, 1):
                     for dy in (-1, 0, 1):
@@ -280,9 +280,9 @@ class BackgroundMap:
         return int(self.mask.sum()) if self.mask is not None else 0
 
 
-# ---------------------------------------------------------------- классификация точек
+# ---------------------------------------------------------------- point classification
 def predict_points(model, dets, ego_speed, ego_moving):
-    """Тип точки по модели (или правилу) + уверенность. Фон → 'background' поверх любого ответа."""
+    """Point type from the model (or a rule) + confidence. Background → 'background' overrides any answer."""
     if not dets:
         return [], []
     if model is None:
@@ -299,29 +299,29 @@ def predict_points(model, dets, ego_speed, ego_moving):
     return kinds, conf
 
 
-# ---------------------------------------------------------------- неоднозначность Доплера
-DOPPLER_PERIOD = None      # м/с; выставляет Pipeline из .cfg. None — заворот не учитывать.
+# ---------------------------------------------------------------- Doppler ambiguity
+DOPPLER_PERIOD = None      # m/s; set by the Pipeline from .cfg. None — wraparound not applied.
 
 
 def doppler_diff(a, b):
-    """Разность скоростей с учётом заворота: +0,85 и −0,97 м/с при периоде 1,95 — это 0,13 м/с, а не 1,82."""
+    """Speed difference accounting for wraparound: +0.85 and −0.97 m/s at a period of 1.95 is 0.13 m/s, not 1.82."""
     d = a - b
     if DOPPLER_PERIOD:
         d -= round(d / DOPPLER_PERIOD) * DOPPLER_PERIOD
     return d
 
 
-# ---------------------------------------------------------------- кластеры
+# ---------------------------------------------------------------- clustering
 def cluster_objects(dets, kinds, confs, eps_m=CLUSTER_EPS_M, v_weight=CLUSTER_V_WEIGHT, min_pts=1):
-    """DBSCAN по (x, y, скорость): человек в метре от столба не слипается с ним, если скорости разные.
-    Скорость кодируется точкой на окружности периода неоднозначности, чтобы объект на границе ±v_max
-    не разваливался на «приближающийся» и «удаляющийся» кластеры."""
+    """DBSCAN over (x, y, speed): a person a meter from a pole won't merge with it if the speeds differ.
+    Speed is encoded as a point on a circle of the ambiguity period, so an object at the ±v_max boundary
+    doesn't split into "approaching" and "receding" clusters."""
     idx = [i for i, k in enumerate(kinds) if k in TARGET_CLASSES]
     if not idx:
         return []
     if DOPPLER_PERIOD:
-        # диаметр окружности = w·(период/2): противоположные скорости (максимальная разница по модулю) далеки
-        # ровно как раньше по прямой, а +v_max и −v_max (соседи через заворот) — рядом
+        # circle diameter = w·(period/2): opposite speeds (max difference in magnitude) are as far apart
+        # as they were on a line before, while +v_max and −v_max (neighbors across the wraparound) are close
         R = v_weight * DOPPLER_PERIOD / 4
         feats = np.array([[dets[i]["x_m"], dets[i]["y_m"],
                            R * math.cos(2 * math.pi * dets[i]["doppler_mps"] / DOPPLER_PERIOD),
@@ -335,7 +335,7 @@ def cluster_objects(dets, kinds, confs, eps_m=CLUSTER_EPS_M, v_weight=CLUSTER_V_
         if lab == -1:
             continue
         mem = [idx[j] for j in range(len(idx)) if labels[j] == lab]
-        w = np.array([max(dets[i]["snr_db"], 1.0) for i in mem])           # веса по SNR
+        w = np.array([max(dets[i]["snr_db"], 1.0) for i in mem])           # weights by SNR
         cx = float(np.average([dets[i]["x_m"] for i in mem], weights=w))
         cy = float(np.average([dets[i]["y_m"] for i in mem], weights=w))
         votes = defaultdict(float)
@@ -346,39 +346,39 @@ def cluster_objects(dets, kinds, confs, eps_m=CLUSTER_EPS_M, v_weight=CLUSTER_V_
             "azimuth_deg": math.degrees(math.atan2(cx, cy)),
             "doppler_mps": float(np.average([dets[i]["doppler_mps"] for i in mem], weights=w)),
             "snr_db": float(np.nanmax([dets[i]["snr_db"] for i in mem])),
-            "range_min_m": float(min(dets[i]["range_m"] for i in mem)),   # ближайшая точка объекта — для остановки
+            "range_min_m": float(min(dets[i]["range_m"] for i in mem)),   # nearest point of the object — for stopping
             "n_points": len(mem), "votes": dict(votes),
         })
     return sorted(objs, key=lambda o: o["range_m"])
 
 
-# ---------------------------------------------------------------- треки (EKF: измерение x, y, vr)
+# ---------------------------------------------------------------- tracks (EKF: measurement x, y, vr)
 class Track:
-    """Состояние [x, y, vx, vy] в системе радара. Измерение — (x, y, радиальная скорость).
-    Радиальная скорость приходит от радара напрямую с точностью ~0,1 м/с, поэтому скорость трека
-    известна с первого-второго кадра, а не «вычисляется по разности позиций»."""
+    """State [x, y, vx, vy] in the radar frame. Measurement — (x, y, radial speed).
+    Radial speed comes straight from the radar with ~0.1 m/s accuracy, so the track's speed
+    is known from the first or second frame, rather than "computed from the position difference"."""
     _next_id = 1
-    R = np.diag([0.2, 0.2, 0.15]) ** 2                     # шум измерения: м, м, м/с
+    R = np.diag([0.2, 0.2, 0.15]) ** 2                     # measurement noise: m, m, m/s
 
     def __init__(self, obj, t):
         self.id = Track._next_id; Track._next_id += 1
         r = max(obj["range_m"], 1e-3)
         vr = obj["doppler_mps"]
-        # начальная скорость — вдоль луча, по Доплеру
+        # initial speed — along the beam, from Doppler
         self.x = np.array([obj["x_m"], obj["y_m"], vr * obj["x_m"] / r, vr * obj["y_m"] / r])
         self.P = np.diag([0.3, 0.3, 0.8, 0.8]) ** 2
         self.hits, self.misses, self.age = 1, 0, 1
         self.confirmed = False
         self.history = [(self.x[0], self.x[1])]
         self.doppler, self.snr, self.n_points = vr, obj["snr_db"], obj["n_points"]
-        self.near_offset = max(0.0, obj["range_m"] - obj.get("range_min_m", obj["range_m"]))  # центр − ближняя точка
+        self.near_offset = max(0.0, obj["range_m"] - obj.get("range_min_m", obj["range_m"]))  # center − nearest point
         self.votes = defaultdict(float, obj.get("votes", {}))
         self.t_created, self.t_updated = t, t
-        self.range_hist = [(t, obj["range_m"])]              # для снятия неоднозначности Доплера по позициям
+        self.range_hist = [(t, obj["range_m"])]              # for resolving Doppler ambiguity from positions
 
     def predict(self, dt):
         F = np.array([[1, 0, dt, 0], [0, 1, 0, dt], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=float)
-        a = 2.5                                           # шум процесса: ускорение ~2,5 м/с² (манёвры, развороты)
+        a = 2.5                                           # process noise: acceleration ~2.5 m/s² (maneuvers, turns)
         G = np.array([[0.5 * dt * dt, 0], [0, 0.5 * dt * dt], [dt, 0], [0, dt]])
         self.x = F @ self.x
         self.P = F @ self.P @ F.T + G @ G.T * a * a
@@ -399,14 +399,14 @@ class Track:
         return z - hx, S, H
 
     def gate_distance(self, obj):
-        """Сопоставление — по позиции (2D Махаланобис). Доплер в гейт не входит: объект, резко
-        сменивший направление (человек развернулся), иначе выпадает из трека."""
+        """Matching — by position (2D Mahalanobis). Doppler is excluded from the gate: otherwise an object
+        that abruptly changes direction (a person turning around) would fall out of the track."""
         d, S, _ = self.innovation(obj)
         d2, S2 = d[:2], S[:2, :2]
         return float(math.sqrt(d2 @ np.linalg.solve(S2, d2)))
 
     def range_rate_from_positions(self):
-        """Скорость изменения дальности по истории позиций за ~0,6 с (МНК). Однозначна — в отличие от Доплера."""
+        """Rate of change of range from position history over ~0.6 s (least squares). Unambiguous — unlike Doppler."""
         pts = [(t_, r_) for t_, r_ in self.range_hist if self.range_hist[-1][0] - t_ <= 0.6]
         if len(pts) < 3 or pts[-1][0] - pts[0][0] < 0.25:
             return None
@@ -414,15 +414,15 @@ class Track:
         return float(np.polyfit(T - T[0], Rg, 1)[0])
 
     def unwrap_doppler(self, z_v):
-        """Снятие неоднозначности: гипотеза z_v + k·период, ближайшая к скорости по позициям (или к
-        предсказанию, если истории мало). Возвращает (скорость, флаг «сомнительно»)."""
+        """Ambiguity resolution: the hypothesis z_v + k·period closest to the position-derived speed (or to
+        the prediction if there's too little history). Returns (speed, "uncertain" flag)."""
         if not DOPPLER_PERIOD:
             return z_v, False
         ref = self.range_rate_from_positions()
         if ref is None:
             ref = self.radial_mps
         cands = sorted(((abs(z_v + k * DOPPLER_PERIOD - ref), z_v + k * DOPPLER_PERIOD) for k in (-1, 0, 1)))
-        ambiguous = (cands[1][0] - cands[0][0]) < 0.4     # две гипотезы почти равноправны
+        ambiguous = (cands[1][0] - cands[0][0]) < 0.4     # two hypotheses are nearly equally likely
         return cands[0][1], ambiguous
 
     def update(self, obj, t):
@@ -430,10 +430,10 @@ class Track:
         obj = {**obj, "doppler_mps": z_v}
         R = self.R.copy()
         if ambiguous:
-            R[2, 2] *= 16                                  # сомнительный Доплер почти не двигает скорость
+            R[2, 2] *= 16                                  # an uncertain Doppler barely moves the speed estimate
         d, S, H = self.innovation(obj, R)
-        # робастность по Доплеру: невязка радиальной скорости больше 3σ → разворот/манёвр или чужая точка,
-        # обновляемся с раздутым шумом скорости, а не отбрасываем измерение
+        # Doppler robustness: a radial-speed residual over 3σ → a turn/maneuver or a foreign point,
+        # so we update with inflated speed noise instead of discarding the measurement
         if abs(d[2]) > 3 * math.sqrt(S[2, 2]):
             R[2, 2] = (abs(d[2]) / 2) ** 2 + R[2, 2]
             d, S, H = self.innovation(obj, R)
@@ -444,7 +444,7 @@ class Track:
         self.range_hist.append((t, obj["range_m"])); self.range_hist = self.range_hist[-12:]
         self.doppler, self.snr, self.n_points = obj["doppler_mps"], obj["snr_db"], obj["n_points"]
         off = max(0.0, obj["range_m"] - obj.get("range_min_m", obj["range_m"]))
-        self.near_offset = 0.7 * self.near_offset + 0.3 * off                # сглаженно: кластер «дышит»
+        self.near_offset = 0.7 * self.near_offset + 0.3 * off                # smoothed: the cluster "breathes"
         for k, v in obj.get("votes", {}).items():
             self.votes[k] += v
         self.history.append((self.x[0], self.x[1])); self.history = self.history[-30:]
@@ -457,13 +457,13 @@ class Track:
     azimuth_deg = property(lambda s: math.degrees(math.atan2(s.x[0], s.x[1])))
     speed_mps = property(lambda s: math.hypot(s.x[2], s.x[3]))
     radial_mps = property(lambda s: (s.x[0] * s.x[2] + s.x[1] * s.x[3]) / max(s.range_m, 1e-3))
-    range_near_m = property(lambda s: max(0.0, s.range_m - s.near_offset))   # до ближней точки объекта
+    range_near_m = property(lambda s: max(0.0, s.range_m - s.near_offset))   # to the nearest point of the object
     sigma_xy_m = property(lambda s: float(math.sqrt(max(s.P[0, 0] + s.P[1, 1], 0.0))))
     coasting = property(lambda s: s.misses > 0)
 
     @property
     def kind(self):
-        """Класс трека — накопленные за жизнь голоса точек, а не ответ последнего кадра."""
+        """Track class — votes from points accumulated over its lifetime, not the last frame's answer."""
         return max(self.votes, key=self.votes.get) if self.votes else "unknown"
 
     @property
@@ -472,7 +472,7 @@ class Track:
         return 100 * self.votes[self.kind] / tot if tot else 0.0
 
     def contract(self):
-        """Запись контракта /radar/tracks — то же, что будет публиковать симулятор и трактор."""
+        """The /radar/tracks contract record — the same thing the simulator and the tractor will publish."""
         return {"id": self.id, "range_m": round(self.range_m, 3), "range_near_m": round(self.range_near_m, 3),
                 "azimuth_deg": round(self.azimuth_deg, 2),
                 "x_m": round(float(self.x[0]), 3), "y_m": round(float(self.x[1]), 3),
@@ -515,7 +515,7 @@ class Tracker:
                 (not tr.confirmed and tr.age > self.confirm_window and tr.hits < self.confirm_hits)
             if not dead:
                 alive.append(tr)
-        alive.sort(key=lambda tr: -tr.hits)                 # дубликаты: оставить трек с большей историей
+        alive.sort(key=lambda tr: -tr.hits)                 # duplicates: keep the track with more history
         kept = []
         for tr in alive:
             if any(math.hypot(tr.x[0] - k.x[0], tr.x[1] - k.x[1]) < self.merge_m
@@ -526,7 +526,7 @@ class Tracker:
         return [tr for tr in self.tracks if tr.confirmed]
 
 
-# ---------------------------------------------------------------- ввод-вывод
+# ---------------------------------------------------------------- input-output
 def send_config(cli_port, cfg_path):
     with serial.Serial(cli_port, 115200, timeout=1) as ser, open(cfg_path, encoding="utf-8") as f:
         for line in f:
@@ -534,13 +534,13 @@ def send_config(cli_port, cfg_path):
             if line and not line.startswith("%"):
                 ser.write((line + "\n").encode())
                 time.sleep(0.05)
-    print("✓ Конфиг отправлен в", cli_port)
+    print("✓ Config sent to", cli_port)
 
 
 def byte_source():
     if DUMP_FILE:
         data = open(DUMP_FILE, "rb").read()
-        print(f"Читаю дамп {DUMP_FILE}: {len(data)} байт, кадров {data.count(MAGIC)}")
+        print(f"Reading dump {DUMP_FILE}: {len(data)} bytes, {data.count(MAGIC)} frames")
         for i in range(0, len(data), 4096):
             yield data[i:i + 4096]
             time.sleep(0.02)
@@ -551,34 +551,34 @@ def byte_source():
         try:
             send_config(CLI_PORT, CFG_FILE)
         except Exception as e:
-            print(f"⚠️ Конфиг не отправлен ({e}). Если радар уже стримит — нормально.")
+            print(f"⚠️ Config not sent ({e}). Fine if the radar is already streaming.")
     with serial.Serial(DATA_PORT, 921600, timeout=0.01) as ser:
-        print("=== Слушаю", DATA_PORT, "· Ctrl+C или q для выхода ===")
+        print("=== Listening on", DATA_PORT, "· Ctrl+C or q to exit ===")
         while True:
-            chunk = ser.read(max(1, ser.in_waiting))     # отдаём, что пришло, не ждём 4096 байт: точнее время
+            chunk = ser.read(max(1, ser.in_waiting))     # yield whatever arrived, don't wait for 4096 bytes: better timing
             if chunk:
                 yield chunk
 
 
 def render(dets, kinds, tracks, bg, meters=DRAW_METERS, title="", only_ids=None):
-    """Кадр вида сверху (BGR 500×540): точки по типу, треки с ID, следом и стрелкой скорости.
-    Используется и живым окном, и записью видео (RECORD_VIDEO)."""
+    """Top-down view frame (BGR 500×540): points by type, tracks with ID, trail, and speed arrow.
+    Used by both the live window and video recording (RECORD_VIDEO)."""
     meters = max(1, int(round(meters)))
     W, H0 = 500, 540
     img = np.zeros((H0, W, 3), dtype=np.uint8)
-    ox, oy = W // 2, H0 - 20                                   # радар — внизу по центру
+    ox, oy = W // 2, H0 - 20                                   # radar — bottom center
     s = (H0 - 60) / meters
     step = 5 if meters > 12 else 2 if meters > 6 else 1
     for r in range(step, meters + 1, step):
         cv2.circle(img, (ox, oy), int(r * s), (45, 45, 45), 1)
         cv2.putText(img, f"{r}m", (ox + 5, oy - int(r * s) - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (95, 95, 95), 1)
-    for ang in (-60, -30, 30, 60):                             # лучи азимута
+    for ang in (-60, -30, 30, 60):                             # azimuth rays
         ex, ey = ox + int(meters * s * math.sin(math.radians(ang))), oy - int(meters * s * math.cos(math.radians(ang)))
         cv2.line(img, (ox, oy), (ex, ey), (35, 35, 35), 1)
     cv2.line(img, (ox, oy), (ox, oy - int(meters * s)), (55, 55, 55), 1)
     for d, k in zip(dets, kinds):
         if only_ids is not None and (k not in TARGET_CLASSES or d.get("is_static", False)):
-            continue                                        # режим «только интересное»: фон и статику не рисуем
+            continue                                        # "interesting only" mode: skip background and static points
         px, py = int(ox + d["x_m"] * s), int(oy - d["y_m"] * s)
         if 0 <= px < W and 0 <= py < H0:
             cv2.circle(img, (px, py), 3, POINT_CLASS_COLOR.get(k, (255, 255, 255)), -1)
@@ -590,7 +590,7 @@ def render(dets, kinds, tracks, bg, meters=DRAW_METERS, title="", only_ids=None)
         for p0, p1 in zip(pts[:-1], pts[1:]):
             cv2.line(img, p0, p1, color, 1)
         px, py = pts[-1]
-        rad = int(max(10, 6 + 2 * tr.n_points))                 # размер кольца — по числу точек
+        rad = int(max(10, 6 + 2 * tr.n_points))                 # ring size — by point count
         cv2.circle(img, (px, py), rad, color, 2)
         vx, vy = tr.x[2], tr.x[3]
         if math.hypot(vx, vy) > 0.15:
@@ -606,7 +606,7 @@ def render(dets, kinds, tracks, bg, meters=DRAW_METERS, title="", only_ids=None)
     cv2.putText(img, status, (8, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 150, 150), 1)
     if title:
         cv2.putText(img, title, (8, H0 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 150, 150), 1)
-    # легенда
+    # legend
     y = 30
     for k, c in (("target", POINT_CLASS_COLOR["target"]), ("target_micro", POINT_CLASS_COLOR["target_micro"]),
                  ("clutter", POINT_CLASS_COLOR["clutter"]), ("background", POINT_CLASS_COLOR["background"])):
@@ -622,7 +622,7 @@ def draw(dets, kinds, tracks, bg, meters=DRAW_METERS, title=""):
     return (cv2.waitKey(1) & 0xFF) == ord("q")
 
 
-# ---------------------------------------------------------------- один кадр (используется и в тестах)
+# ---------------------------------------------------------------- one frame (also used in tests)
 class Pipeline:
     def __init__(self, cfg, model=None, ego_speed=0.0, use_background=USE_BACKGROUND):
         self.cfg, self.model, self.ego = cfg, model, ego_speed
@@ -635,7 +635,7 @@ class Pipeline:
         self.last_frame_num, self.t = None, 0.0
 
     def process(self, frame):
-        # время — из номера кадра радара: пропуск пакетов по USB не сжимает время трекера
+        # time — from the radar frame number: dropped USB packets don't compress the tracker's time
         if self.last_frame_num is not None:
             gap = frame["frame"] - self.last_frame_num
             dt = self.period * (gap if 0 < gap < 100 else 1)
@@ -659,15 +659,15 @@ def main():
     model = None
     if joblib is not None:
         try:
-            model = joblib.load(MODEL_PATH)          # собственный .pkl команды; чужие pickle не грузить
-            print("✓ Модель LightGBM загружена:", MODEL_PATH)
+            model = joblib.load(MODEL_PATH)          # the team's own .pkl; never load someone else's pickle
+            print("✓ LightGBM model loaded:", MODEL_PATH)
         except Exception as e:
-            print(f"⚠️ Модель не загружена ({e}) — правило SNR ≥ 15 дБ")
+            print(f"⚠️ Model not loaded ({e}) — falling back to the SNR ≥ 15 dB rule")
     cfg = parse_cfg(CFG_FILE)
-    print("Из .cfg:", {k: (round(v, 3) if isinstance(v, float) else v) for k, v in cfg.items()})
+    print("From .cfg:", {k: (round(v, 3) if isinstance(v, float) else v) for k, v in cfg.items()})
     if cfg.get("max_doppler_mps") and cfg["max_doppler_mps"] < 3:
-        print(f"⚠️ Максимум однозначной скорости {cfg['max_doppler_mps']:.2f} м/с — для трактора мало, "
-              f"нужен профиль с ≥ 5 м/с")
+        print(f"⚠️ Max unambiguous speed {cfg['max_doppler_mps']:.2f} m/s — too low for the tractor, "
+              f"need a profile with ≥ 5 m/s")
 
     pipe = Pipeline(cfg, model, EGO_SPEED_MPS)
     log = open(f"frames_{datetime.now():%Y%m%d_%H%M%S}.jsonl", "w", encoding="utf-8") if LOG_JSONL else None
@@ -689,12 +689,12 @@ def main():
                 if n % 5 == 0:
                     fps = n / max(time.time() - t0, 1e-6)
                     counts = pd.Series(out["kinds"]).value_counts().to_dict() if out["kinds"] else {}
-                    nz = f" · шум ближн. +{out['noise']['near_excess_db']:.1f} дБ" if out["noise"] else ""
-                    print(f"\nкадр {frame['frame']} · {fps:.1f} кадр/с · точек {len(out['dets'])} · {counts}{nz}")
+                    nz = f" · near noise +{out['noise']['near_excess_db']:.1f} dB" if out["noise"] else ""
+                    print(f"\nframe {frame['frame']} · {fps:.1f} fps · points {len(out['dets'])} · {counts}{nz}")
                     for tr in out["tracks"]:
-                        st = "предск." if tr.coasting else "измерен"
-                        print(f"  #{tr.id:<3} {tr.kind:12s} {tr.range_m:5.2f} м  {tr.azimuth_deg:+4.0f}°  "
-                              f"{tr.radial_mps:+5.2f} м/с  |v|={tr.speed_mps:4.2f}  hits {tr.hits:3d}  {st}")
+                        st = "predicted" if tr.coasting else "measured"
+                        print(f"  #{tr.id:<3} {tr.kind:12s} {tr.range_m:5.2f} m  {tr.azimuth_deg:+4.0f}°  "
+                              f"{tr.radial_mps:+5.2f} m/s  |v|={tr.speed_mps:4.2f}  hits {tr.hits:3d}  {st}")
                 if log:
                     log.write(json.dumps({
                         "t": out["t"], "frame": frame["frame"], "ego_speed_mps": EGO_SPEED_MPS,
@@ -706,13 +706,13 @@ def main():
                 if draw(out["dets"], out["kinds"], out["tracks"], pipe.bg, title=f"frame {frame['frame']}  t={out['t']:.1f}s"):
                     raise KeyboardInterrupt
     except KeyboardInterrupt:
-        print("\n⏹ Остановлено.")
+        print("\n⏹ Stopped.")
     finally:
         if log:
             log.close()
         if cv2 is not None:
             cv2.destroyAllWindows()
-        print(f"Кадров обработано: {n}")
+        print(f"Frames processed: {n}")
 
 
 if __name__ == "__main__":

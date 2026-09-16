@@ -35,10 +35,10 @@ try:
 except ImportError:
     YOLO = None
 
-# ---------------------------------------------------------------- НАСТРОЙКИ
+# ---------------------------------------------------------------- SETTINGS
 CAMERA_INDEX = 0
-DETECTOR = "yolov8n"       # "yolov8n" — COCO, быстрый; "yolo-world" — открытый словарь (WORLD_CLASSES),
-                           # первый запуск качает веса + CLIP (~340 МБ), на CPU ~0,25 с/кадр
+DETECTOR = "yolov8n"       # "yolov8n" — COCO, fast; "yolo-world" — open vocabulary (WORLD_CLASSES),
+                           # first run downloads weights + CLIP (~340 MB), ~0.25 s/frame on CPU
 YOLO_WEIGHTS = {"yolov8n": "yolov8n.pt", "yolo-world": "yolov8s-worldv2.pt"}
 YOLO_CONF = 0.4
 YOLO_KEEP = {0: ("person", 1.70), 1: ("bicycle", 1.10), 2: ("car", 1.50), 3: ("motorcycle", 1.20),
@@ -47,56 +47,56 @@ YOLO_KEEP = {0: ("person", 1.70), 1: ("bicycle", 1.10), 2: ("car", 1.50), 3: ("m
 WORLD_CLASSES = {"person": 1.70, "car": 1.50, "truck": 3.00, "tractor": 2.80, "dog": 0.55, "cow": 1.40,
                  "aluminum can": 0.12, "bottle": 0.25, "chair": 0.90, "pole": 2.00, "box": 0.40}
 
-CAM_HFOV_DEG = 70.0        # горизонтальный угол обзора камеры
-CAM_YAW_DEG = 0.0          # yaw = азимут_радара − азимут_камеры для одного объекта (медиана по парам);
-                           # положителен, если ось радара повёрнута ВЛЕВО от оси камеры. Уточняется калибровкой.
-RADAR_TO_CAMERA_M = {"right": 0.0, "up": 0.0, "forward": 0.0}   # где радар относительно объектива; читается из meta.json
-MAX_DT_S = 0.15            # допустимый рассинхрон кадра камеры и радара
-AZ_SIGMA_DEG = 4.0         # ожидаемая ошибка азимута между сенсорами
-RANGE_REL_SIGMA = 0.35     # относительная ошибка дальности по высоте bbox (±35 %)
-CLIPPED_RANGE_SIGMA = 1.2  # ...если bbox упирается в край кадра — высота обрезана, дальность лишь верхняя граница
-GATE = 3.0                 # порог сопоставления в сигмах
-HISTORY_BONUS = 1.0        # скидка к стоимости, если детекция с тем же cam_id уже шла с этим треком
-PAIR_CONFIRM = 5           # совпадений, чтобы трек стал «объектом с классом»
-FORGET_S = 2.0             # память трека без радара — столько секунд
-HOLD_MAX_S = 30.0          # камера потеряла объект, радар ведёт: сколько секунд держим рамку
-HOLD_FOV_MARGIN_DEG = 8.0  # объект «в кадре», если азимут внутри FOV с запасом ≥ 2·AZ_SIGMA
-MERGE_DIST_M = 0.9         # радарный трек без пары ближе этого к объекту...
-MERGE_DV_MPS = 0.8         # ...с близкой скоростью (с учётом заворота) и в том же азимуте — его часть, не объект
+CAM_HFOV_DEG = 70.0        # camera horizontal field of view
+CAM_YAW_DEG = 0.0          # yaw = radar_azimuth − camera_azimuth for the same object (median over pairs);
+                           # positive if the radar axis is rotated LEFT of the camera axis. Refined by calibration.
+RADAR_TO_CAMERA_M = {"right": 0.0, "up": 0.0, "forward": 0.0}   # where the radar is relative to the lens; read from meta.json
+MAX_DT_S = 0.15            # allowed desync between camera and radar frames
+AZ_SIGMA_DEG = 4.0         # expected azimuth error between sensors
+RANGE_REL_SIGMA = 0.35     # relative range error from bbox height (±35 %)
+CLIPPED_RANGE_SIGMA = 1.2  # ...if the bbox hits the frame edge — height is clipped, range is only an upper bound
+GATE = 3.0                 # matching threshold in sigmas
+HISTORY_BONUS = 1.0        # cost discount if a detection with the same cam_id already matched this track
+PAIR_CONFIRM = 5           # matches needed for a track to become an "object with a class"
+FORGET_S = 2.0             # track memory without radar — this many seconds
+HOLD_MAX_S = 30.0          # camera lost the object, radar is tracking: how many seconds to hold the box
+HOLD_FOV_MARGIN_DEG = 8.0  # object is "in frame" if azimuth is within FOV with margin ≥ 2·AZ_SIGMA
+MERGE_DIST_M = 0.9         # an unpaired radar track closer than this to an object...
+MERGE_DV_MPS = 0.8         # ...with a similar speed (wraparound-aware) and the same azimuth — is part of it, not a separate object
 SHOW_ONLY_INTERESTING = True
 MOVING_MPS = 0.25
-RADAR_STALE_S = 0.5        # радар не обновлялся столько — считаем потерянным (баннер, треки не рисуем)
+RADAR_STALE_S = 0.5        # radar hasn't updated for this long — consider it lost (banner, tracks not drawn)
 CSV_PATH = f"fusion_{datetime.now():%Y%m%d_%H%M%S}.csv"
 SHOW_WINDOW = True
 
-Q_SHARP_DROP = 0.45        # резкость ниже 45 % эталона
-Q_CONTRAST_DROP = 0.45     # контраст ниже 45 % эталона
+Q_SHARP_DROP = 0.45        # sharpness below 45 % of the reference
+Q_CONTRAST_DROP = 0.45     # contrast below 45 % of the reference
 
 
-# ---------------------------------------------------------------- геометрия камеры
+# ---------------------------------------------------------------- camera geometry
 class CameraModel:
-    """Пиксель ↔ азимут через фокус в пикселях. Радар и камера стоят в разных точках: все камерные
-    величины считаются от точки объектива (параллакс), yaw — разворот осей."""
+    """Pixel ↔ azimuth via focal length in pixels. The radar and camera sit at different points: all camera
+    quantities are computed from the lens point (parallax); yaw is the axis rotation."""
 
     def __init__(self, width, height, hfov_deg=CAM_HFOV_DEG, yaw_deg=CAM_YAW_DEG, radar_to_cam=None):
         self.w, self.h = width, height
         self.set_hfov(hfov_deg)
         self.yaw = yaw_deg
         rc = radar_to_cam or RADAR_TO_CAMERA_M
-        self.dx, self.dy = rc.get("right", 0.0), rc.get("forward", 0.0)   # радар относительно объектива, м
+        self.dx, self.dy = rc.get("right", 0.0), rc.get("forward", 0.0)   # radar relative to the lens, m
 
     def set_hfov(self, hfov_deg):
         self.hfov = hfov_deg
         self.f = (self.w / 2) / math.tan(math.radians(hfov_deg / 2))
 
-    # --- точка в системе радара → как её видит камера
+    # --- a point in the radar frame → how the camera sees it
     def cam_view(self, x_r, y_r):
-        """(азимут в системе радара, но от точки камеры; глубина от камеры). x вправо, y вперёд."""
+        """(azimuth in the radar frame, but from the camera point; depth from the camera). x is right, y is forward."""
         xc, yc = x_r + self.dx, y_r + self.dy
         return math.degrees(math.atan2(xc, yc)), yc
 
     def azimuth_of_u(self, u):
-        """Азимут пикселя, приведённый к системе радара (yaw учтён), от точки камеры."""
+        """Pixel azimuth converted to the radar frame (yaw applied), from the camera point."""
         return math.degrees(math.atan2(u - self.w / 2, self.f)) + self.yaw
 
     def u_of_cam_azimuth(self, az_from_cam_deg):
@@ -125,13 +125,13 @@ class Calibrator:
         return float(np.median(self.pairs)) if len(self.pairs) >= self.min_pairs else None
 
 
-# ---------------------------------------------------------------- качество кадра
+# ---------------------------------------------------------------- frame quality
 def frame_quality(gray, bbox):
     if gray is None or cv2 is None:
         return None
     h, w = gray.shape[:2]
     x1, y1, x2, y2 = bbox
-    # центральные 60 % рамки: края виртуальной рамки часто захватывают фон, а не объект/преграду
+    # central 60 % of the box: the edges of a virtual box often capture background, not the object/occluder
     cx, cy, bw, bh = (x1 + x2) / 2, (y1 + y2) / 2, (x2 - x1) * 0.6, (y2 - y1) * 0.6
     x1, x2 = int(max(0, min(w - 1, cx - bw / 2))), int(max(0, min(w, cx + bw / 2)))
     y1, y2 = int(max(0, min(h - 1, cy - bh / 2))), int(max(0, min(h, cy + bh / 2)))
@@ -144,7 +144,7 @@ def frame_quality(gray, bbox):
 
 
 def lost_reason(ref, now):
-    """экспозиция → весь кадр (дымка/туман/расфокус) → зона объекта (закрыт) → промах детектора."""
+    """exposure → whole frame (haze/fog/defocus) → object area (occluded) → detector miss."""
     if now is None:
         return "no frame"
     if ref is None:
@@ -158,7 +158,7 @@ def lost_reason(ref, now):
     return "detector miss"
 
 
-# ---------------------------------------------------------------- данные
+# ---------------------------------------------------------------- data
 @dataclass
 class CamDet:
     t: float
@@ -176,7 +176,7 @@ class CamDet:
 
 @dataclass
 class TrackMem:
-    """Память объекта по радарному треку (а не по паре ID — ByteTrack меняет ID, радарный трек стабильнее)."""
+    """Object memory keyed by the radar track (not by ID pair — ByteTrack changes IDs, the radar track is more stable)."""
     radar_id: int
     hits: int = 0
     cam_id: Optional[int] = None
@@ -186,12 +186,12 @@ class TrackMem:
     last_bbox: Optional[tuple] = None
     last_bbox_range: float = 0.0
     last_bbox_side_clipped: bool = False
-    last_full_width_px: float = 0.0     # ширина последней рамки, не обрезанной краем кадра
+    last_full_width_px: float = 0.0     # width of the last box not clipped by the frame edge
     last_full_width_range: float = 0.0
     last_az_from_cam: float = 0.0
     ref_quality: Optional[dict] = None
     reasons: deque = field(default_factory=lambda: deque(maxlen=10))
-    # история (1/r, v_top, v_bottom) пока камера видит: v_edge = v_h + k/r → горизонт и масштаб рамки
+    # history of (1/r, v_top, v_bottom) while the camera can see it: v_edge = v_h + k/r → horizon and box scale
     edge_hist: deque = field(default_factory=lambda: deque(maxlen=60))
 
     @property
@@ -199,18 +199,18 @@ class TrackMem:
         return max(self.classes, key=self.classes.get) if self.classes else "unknown"
 
     def edge_model(self, which):
-        """Линейная регрессия v_edge = a + b·(1/r) по истории; None, если истории мало или разброс дальностей мал."""
+        """Linear regression v_edge = a + b·(1/r) over the history; None if there's too little history or too little range spread."""
         pts = [(inv_r, vt if which == "top" else vb) for inv_r, vt, vb in self.edge_hist if (vt if which == "top" else vb) is not None]
         if len(pts) < 4:
             return None
         X = np.array([p[0] for p in pts]); Y = np.array([p[1] for p in pts])
-        if X.max() - X.min() < 0.08:                       # дальности почти не менялись — наклон не определён
+        if X.max() - X.min() < 0.08:                       # ranges barely changed — slope is undetermined
             return None
         b, a = np.polyfit(X, Y, 1)
         return a, b
 
 
-# ---------------------------------------------------------------- слияние
+# ---------------------------------------------------------------- fusion
 class Fusion:
     def __init__(self, cam: CameraModel, csv_path=CSV_PATH):
         self.cam = cam
@@ -240,15 +240,15 @@ class Fusion:
         return best[1], best[0] - t, best[2]
 
     def _virtual_bbox(self, m: TrackMem, r_new, az_from_cam):
-        """Рамка от радара, когда камера не видит. Горизонталь — азимут трека (от точки камеры), ширина —
-        по отношению дальностей. Вертикаль — по модели края v = v_h + k/r, выученной, пока камера видела;
-        если модели нет — масштаб от центра кадра (без сценарных допущений о высоте камеры)."""
+        """Box from radar when the camera can't see. Horizontal — track azimuth (from the camera point), width —
+        from the range ratio. Vertical — from the edge model v = v_h + k/r learned while the camera could see;
+        if there's no model — scale from the frame center (no scenario assumptions about camera height)."""
         x1, y1, x2, y2 = m.last_bbox
         scale = m.last_bbox_range / max(r_new, 0.3)
         if m.last_bbox_side_clipped and m.last_full_width_px > 0:
-            bw = m.last_full_width_px * m.last_full_width_range / max(r_new, 0.3)   # обрезанную ширину не масштабируем
+            bw = m.last_full_width_px * m.last_full_width_range / max(r_new, 0.3)   # don't scale a clipped width
         elif m.last_bbox_side_clipped:
-            bw = (y2 - y1) * scale * 0.42                                          # пропорции человека
+            bw = (y2 - y1) * scale * 0.42                                          # human proportions
         else:
             bw = (x2 - x1) * scale
         cu = self.cam.u_of_cam_azimuth(az_from_cam)
@@ -263,7 +263,7 @@ class Fusion:
                 v_h = self.cam.h / 2
                 edges.append(v_h + (v_old - v_h) * scale)
         ny1, ny2 = min(edges), max(edges)
-        # рамка не выходит за кадр: то, что за краем, камера всё равно не показала бы
+        # the box doesn't extend past the frame: what's beyond the edge the camera wouldn't show anyway
         return (int(max(0, cu - bw / 2)), int(max(0, ny1)), int(min(self.cam.w - 1, cu + bw / 2)), int(min(self.cam.h - 1, ny2)))
 
     def on_radar(self, t, radar_frame, tracks):
@@ -271,7 +271,7 @@ class Fusion:
         cam_dets = cam_dets or []
         cam_view = [self.cam.cam_view(float(tr.x[0]), float(tr.x[1])) for tr in tracks]   # (az_from_cam, depth)
 
-        # 1) сопоставление: стоимость = геометрия − бонус за историю; обрезанный bbox — дальность неточная
+        # 1) matching: cost = geometry − history bonus; a clipped bbox means an inaccurate range
         cand = []
         for i, tr in enumerate(tracks):
             az_tr, depth_tr = cam_view[i]
@@ -294,7 +294,7 @@ class Fusion:
                 continue
             used_t.add(i); used_c.add(j); matched[i] = j
 
-        # 2) память треков
+        # 2) track memory
         for i, j in matched.items():
             tr, d = tracks[i], cam_dets[j]
             m = self.mem.setdefault(tr.id, TrackMem(tr.id))
@@ -322,7 +322,7 @@ class Fusion:
             elif t - m.last_t > FORGET_S:
                 del self.mem[rid]
 
-        # 3) состояние
+        # 3) state
         fused = []
         for i, tr in enumerate(tracks):
             m = self.mem.get(tr.id)
@@ -332,7 +332,7 @@ class Fusion:
             in_fov = abs(az_from_cam - self.cam.yaw) < self.cam.hfov / 2 - HOLD_FOV_MARGIN_DEG
             left_frame = False
             if confirmed and d is None and m.last_bbox_side_clipped:
-                # последняя рамка упиралась в боковой край, а азимут ушёл ещё дальше к краю — объект вышел из кадра
+                # the last box was against the side edge, and the azimuth moved further toward the edge — the object left the frame
                 left_frame = abs(az_from_cam) > abs(m.last_az_from_cam) + 0.5
             if confirmed and d is not None:
                 state = "both"
@@ -361,7 +361,7 @@ class Fusion:
                 "absorbed_by": None, "x_m": float(tr.x[0]), "y_m": float(tr.x[1]),
             })
 
-        # 4) поглощение дублей: только треки без своей детекции/памяти, измеренные сейчас, в том же азимуте
+        # 4) absorbing duplicates: only tracks with no detection/memory of their own, measured now, at the same azimuth
         anchors = [f for f in fused if f["state"] in ("both", "hold")]
         for idx_f, f in enumerate(fused):
             if f["state"] != "radar-only" or f["matched_now"] or f["hits"] > 0 or f["coasting"]:
@@ -408,7 +408,7 @@ class Fusion:
             self.csv.close()
 
 
-# ---------------------------------------------------------------- камера
+# ---------------------------------------------------------------- camera
 def load_detector(kind=DETECTOR):
     model = YOLO(YOLO_WEIGHTS[kind])
     if kind == "yolo-world":
@@ -434,7 +434,7 @@ def yolo_detections(model, frame, t, keep=YOLO_KEEP):
     return dets
 
 
-# ---------------------------------------------------------------- отрисовка
+# ---------------------------------------------------------------- rendering
 def _range_label(img, x, y, text, color, scale=0.9):
     (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, scale, 2)
     cv2.rectangle(img, (x - 3, y - th - 6), (x + tw + 3, y + 4), (0, 0, 0), -1)
@@ -452,9 +452,9 @@ def _dashed_rect(img, p1, p2, color, thick=2, dash=12):
 
 
 def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, radar_stale=False):
-    """Зелёная рамка — оба сенсора; голубая — камера потеряла, ведёт радар (пунктир — радар по предсказанию);
-    оранжевая тонкая — только камера (дальность по высоте bbox, «≤» если бокс обрезан краем);
-    красный кружок — движущийся радар без пары. Число на рамке — дальность до ближней точки (радар)."""
+    """Green box — both sensors; cyan — camera lost it, radar is tracking (dashed — radar on prediction);
+    thin orange — camera only (range from bbox height, "≤" if the box is clipped by the edge);
+    red circle — moving radar with no pair. The number on the box is the range to the nearest point (radar)."""
     img = frame.copy()
     if radar_stale:
         _range_label(img, 8, 30, "RADAR LOST / STALE — camera only", (0, 60, 255), 0.7)
@@ -531,7 +531,7 @@ def interesting_ids(fused):
             (f.get("state") in ("both", "hold") or abs(f["radial_mps"]) >= MOVING_MPS or f.get("speed_mps", 0) >= MOVING_MPS)}
 
 
-# ---------------------------------------------------------------- живой режим
+# ---------------------------------------------------------------- live mode
 def run_live(dump=None):
     if cv2 is None:
         raise SystemExit("pip install opencv-python")
@@ -542,7 +542,7 @@ def run_live(dump=None):
     cfg = radar.parse_cfg(radar.CFG_FILE)
     model_r = None
     try:
-        import joblib; model_r = joblib.load(radar.MODEL_PATH)      # собственная модель команды
+        import joblib; model_r = joblib.load(radar.MODEL_PATH)      # the team's own model
     except Exception:
         pass
     pipe = radar.Pipeline(cfg, model_r, radar.EGO_SPEED_MPS)
@@ -583,9 +583,9 @@ def run_live(dump=None):
                     fused, dets, matched = fus.on_radar(clock(), fr["frame"], out["tracks"])
                     state["snap"] = {"t": clock(), "fused": fused, "dets": dets, "matched": matched,
                                      "tracks": out["tracks"], "rdets": out["dets"], "rkinds": out["kinds"]}
-        except BaseException as e:                               # смерть потока не должна быть тихой
+        except BaseException as e:                               # a thread dying shouldn't be silent
             state["error"] = f"{type(e).__name__}: {e}"
-            print("РАДАР ОСТАНОВЛЕН:", state["error"], flush=True)
+            print("RADAR STOPPED:", state["error"], flush=True)
 
     threading.Thread(target=radar_thread, daemon=True).start()
     n = 0
@@ -601,7 +601,7 @@ def run_live(dump=None):
             if n % 50 == 0:
                 yaw = fus.apply_calibration()
                 if yaw is not None:
-                    print(f"калибровка: yaw радар↔камера = {yaw:+.1f}° ({len(fus.calib.pairs)} пар)")
+                    print(f"calibration: yaw radar↔camera = {yaw:+.1f}° ({len(fus.calib.pairs)} pairs)")
             s = state["snap"]
             stale = (t - s["t"]) > RADAR_STALE_S or state["error"] is not None
             if SHOW_WINDOW:
@@ -621,7 +621,7 @@ def run_live(dump=None):
         print("CSV:", CSV_PATH)
 
 
-# ---------------------------------------------------------------- самопроверка без камеры
+# ---------------------------------------------------------------- self-test without a camera
 def selftest(dump, true_yaw_deg=4.0, seed=0, verbose=True):
     rng = np.random.default_rng(seed)
     cfg = {"range_res_m": 0.044, "doppler_res_mps": 0.125, "num_doppler_bins": 16, "frame_period_s": 0.1,
@@ -665,13 +665,13 @@ def selftest(dump, true_yaw_deg=4.0, seed=0, verbose=True):
     import pandas as pd
     df = pd.read_csv(csv_path)
     dup = df[df.radar_id.notna()].duplicated(subset=["radar_frame", "radar_id"]).sum()
-    res = {"кадров радара": stats["radar_frames"], "треков всего (кадро-треков)": stats["tracks"],
-           "совпало с камерой сейчас": stats["matched_now"], "подтверждённых (кадро-треков)": stats["fused_confirmed"],
-           "класс person получили": stats["class_person"], "поглощено дублей (кадро-треков)": stats["absorbed"],
-           "yaw истинный": true_yaw_deg, "yaw оценка на кадре 40": round(stats["yaw_est_at_40"], 2),
-           "yaw оценка в конце": round(yaw_final, 2) if yaw_final is not None else None,
-           "строк CSV": len(df), "дублей (radar_frame, radar_id)": int(dup),
-           "строк cam-only": int((df.state == "cam-only").sum()), "объектов в памяти в конце": len(fus.mem)}
+    res = {"radar_frames": stats["radar_frames"], "total_tracks (frame-tracks)": stats["tracks"],
+           "matched_with_camera_now": stats["matched_now"], "confirmed (frame-tracks)": stats["fused_confirmed"],
+           "got_class_person": stats["class_person"], "duplicates_absorbed (frame-tracks)": stats["absorbed"],
+           "true_yaw": true_yaw_deg, "yaw_estimate_at_frame_40": round(stats["yaw_est_at_40"], 2),
+           "yaw_estimate_at_end": round(yaw_final, 2) if yaw_final is not None else None,
+           "csv_rows": len(df), "duplicates (radar_frame, radar_id)": int(dup),
+           "cam_only_rows": int((df.state == "cam-only").sum()), "objects_in_memory_at_end": len(fus.mem)}
     if verbose:
         for k_, v_ in res.items():
             print(f"  {k_}: {v_}")

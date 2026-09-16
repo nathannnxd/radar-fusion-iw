@@ -1,14 +1,14 @@
-"""fusion_offline.py — прогон слияния по папке record_sync (rec_*/): видео + радар на одной оси времени.
+"""fusion_offline.py — run fusion over a record_sync folder (rec_*/): video + radar on one shared timeline.
 
     python fusion_offline.py rec_20260915_180817 [--out fused.mp4] [--meters 8] [--detector yolo-world]
                               [--blind a,b | --miss a,b | --occlude a,b]
 
-Имитации потери камеры (секунды a..b):
-  --blind    весь кадр размыт, детекций нет            → ожидаем причину «haze / smoke / defocus»
-  --miss     кадр чистый, детекций нет                 → «detector miss»
-  --occlude  над РЕАЛЬНЫМ человеком (YOLO на чистом кадре) нарисован «лист», детектор работает по кадру с листом
-             → «occluded»; заодно меряется IoU виртуальной рамки с правдой
-Время камеры — camera_times.csv; время радара — radar_times.csv (кусок байтов, в котором лежит последний байт кадра).
+Simulated camera loss (seconds a..b):
+  --blind    the whole frame is blurred, no detections           → expect reason "haze / smoke / defocus"
+  --miss     the frame is clean, no detections                   → "detector miss"
+  --occlude  a "sheet" is drawn over the REAL person (YOLO on the clean frame); the detector runs on the sheet frame
+             → "occluded"; also measures IoU of the virtual box against ground truth
+Camera time — camera_times.csv; radar time — radar_times.csv (the byte chunk containing the last byte of the frame).
 """
 import argparse
 import csv
@@ -43,7 +43,7 @@ def radar_frames_with_time(rec):
         fr = radar.parse_frame(data[i:i + total])
         if fr:
             last_byte = i + total - 1
-            k = np.searchsorted(offs, last_byte, side="right") - 1        # кусок, содержащий последний байт кадра
+            k = np.searchsorted(offs, last_byte, side="right") - 1        # the chunk containing the last byte of the frame
             fr["t"] = float(ts[min(max(k, 0), len(ts) - 1)])
             frames.append(fr)
         pos = i + total
@@ -84,8 +84,8 @@ def main():
     ctimes = camera_times(rec)
     cap = cv2.VideoCapture(os.path.join(rec, "camera.mp4"))
     w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"радар: {len(rframes)} кадров, {rframes[0]['t']:.2f}–{rframes[-1]['t']:.2f} с · камера: {len(ctimes)} кадров {w}x{h}"
-          f" · радар относительно камеры {radar_to_cam} · период Доплера {cfg.get('doppler_period_mps')}")
+    print(f"radar: {len(rframes)} frames, {rframes[0]['t']:.2f}–{rframes[-1]['t']:.2f} s · camera: {len(ctimes)} frames {w}x{h}"
+          f" · radar relative to camera {radar_to_cam} · Doppler period {cfg.get('doppler_period_mps')}")
 
     radar.Track._next_id = 1
     pipe = radar.Pipeline(cfg, None, 0.0, use_background=True)
@@ -103,7 +103,7 @@ def main():
         if not ok:
             break
         t = ctimes.get(n, n / 30.0); n += 1
-        while ri < len(rframes) and rframes[ri]["t"] <= t:                   # радар до этого момента
+        while ri < len(rframes) and rframes[ri]["t"] <= t:                   # radar up to this moment
             fr = rframes[ri]; ri += 1
             out = pipe.process(fr)
             fused, dets, matched = fus.on_radar(fr["t"], fr["frame"], out["tracks"])
@@ -116,10 +116,10 @@ def main():
         in_occl = bool(occl and occl[0] <= t <= occl[1])
         truth_box = None
         if in_occl:
-            truth = [d for d in F.yolo_detections(yolo, frame, t, keep) if d.cls == "person"]   # правда — до листа
+            truth = [d for d in F.yolo_detections(yolo, frame, t, keep) if d.cls == "person"]   # ground truth — before the sheet
             if truth:
                 held = [f for f in latest["fused"] if f.get("state") in ("both", "hold") and f.get("bbox")]
-                if held:                                       # правда — человек, ближайший к удерживаемой рамке
+                if held:                                       # ground truth — the person closest to the held box
                     hb = held[0]["bbox"]; hcx = (hb[0] + hb[2]) / 2
                     d0 = min(truth, key=lambda d: abs(d.cx - hcx))
                 else:
@@ -136,7 +136,7 @@ def main():
         if n % 50 == 0:
             yaw = fus.apply_calibration()
             if yaw is not None and n % 300 == 0:
-                print(f"  t={t:5.1f}s  yaw радар↔камера = {yaw:+.1f}° по {len(fus.calib.pairs)} парам")
+                print(f"  t={t:5.1f}s  yaw radar↔camera = {yaw:+.1f}° over {len(fus.calib.pairs)} pairs")
         label = "CAMERA BLIND (simulated haze)" if in_blind else "DETECTOR OFF (simulated miss)" if in_miss else \
             "SHEET OVER PERSON (simulated occlusion)" if in_occl else None
         if label:
@@ -151,7 +151,7 @@ def main():
             reasons.setdefault(mode, defaultdict(int))[f.get("lost_reason") or "?"] += 1
             if truth_box is not None and f.get("bbox"):
                 ious.append(iou(f["bbox"], truth_box))
-                cv2.rectangle(left, truth_box[:2], truth_box[2:], (255, 255, 255), 1)   # правда — тонкой белой
+                cv2.rectangle(left, truth_box[:2], truth_box[2:], (255, 255, 255), 1)   # ground truth — thin white
         cv2.putText(left, f"t={t:5.1f}s  yaw={cam.yaw:+.1f}", (8, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         right = radar.render(latest["rdets"], latest["rkinds"], latest["tracks"], pipe.bg, meters=a.meters,
                              title=f"radar t={t:.1f}s", only_ids=F.interesting_ids(latest["fused"]))
@@ -160,18 +160,18 @@ def main():
         vw.write(canvas)
     vw.release(); fus.close()
     yaw = fus.calib.yaw()
-    print("\nсводка:")
-    print(f"  кадров камеры {stats['cam_frames']}, с человеком по YOLO {stats['cam_person']} ({100*stats['cam_person']/max(stats['cam_frames'],1):.0f} %)")
-    print(f"  кадров радара {stats['radar_frames']}: совпадение сейчас {stats['matched_frames']}, с подтверждённым объектом {stats['confirmed_frames']}")
-    print(f"  кадров, где рамку держал радар: {stats['hold_frames']}; поглощено дублей: {stats['absorbed']}; вышло из кадра (кадро-треков): {stats['out_of_frame']}")
+    print("\nsummary:")
+    print(f"  camera frames {stats['cam_frames']}, with a person per YOLO {stats['cam_person']} ({100*stats['cam_person']/max(stats['cam_frames'],1):.0f} %)")
+    print(f"  radar frames {stats['radar_frames']}: currently matched {stats['matched_frames']}, with a confirmed object {stats['confirmed_frames']}")
+    print(f"  frames where the box was held by radar: {stats['hold_frames']}; duplicates absorbed: {stats['absorbed']}; left the frame (frame-tracks): {stats['out_of_frame']}")
     for mode, cnt in reasons.items():
-        print(f"  причины потери камеры [{mode}]: {dict(cnt)}")
+        print(f"  camera-loss reasons [{mode}]: {dict(cnt)}")
     if ious:
         ious = np.array(ious)
-        print(f"  виртуальная рамка vs правда (occlude): IoU средн {ious.mean():.2f}, медиана {np.median(ious):.2f}, доля IoU<0.5: {(ious<0.5).mean():.0%} (n={len(ious)})")
-    print(f"  разворот радар↔камера (калибровка): {yaw:+.1f}° по {len(fus.calib.pairs)} парам" if yaw is not None else "  калибровка: мало пар")
-    print(f"  объектов в памяти в конце: {len(fus.mem)}; {[(m.radar_id, m.cam_id, m.cls, m.hits) for m in fus.mem.values() if m.hits >= F.PAIR_CONFIRM]}")
-    print(f"  видео: {out_path}; CSV: {os.path.join(rec, 'fusion.csv')}")
+        print(f"  virtual box vs ground truth (occlude): IoU mean {ious.mean():.2f}, median {np.median(ious):.2f}, share IoU<0.5: {(ious<0.5).mean():.0%} (n={len(ious)})")
+    print(f"  radar↔camera rotation (calibration): {yaw:+.1f}° over {len(fus.calib.pairs)} pairs" if yaw is not None else "  calibration: too few pairs")
+    print(f"  objects in memory at the end: {len(fus.mem)}; {[(m.radar_id, m.cam_id, m.cls, m.hits) for m in fus.mem.values() if m.hits >= F.PAIR_CONFIRM]}")
+    print(f"  video: {out_path}; CSV: {os.path.join(rec, 'fusion.csv')}")
 
 
 if __name__ == "__main__":

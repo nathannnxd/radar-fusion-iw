@@ -1,15 +1,15 @@
-"""record_sync.py — одновременная запись камеры ноутбука и радара IWR1642 с общими часами.
+"""record_sync.py — simultaneous recording of the laptop camera and the IWR1642 radar on a shared clock.
 
     python record_sync.py
 
-Выход — клавиша q в окне камеры или Ctrl+C. На выходе папка rec_<время>/ :
-    camera.mp4          видео с камеры
-    camera_times.csv    номер кадра → время записи (с от старта)
-    radar.bin           сырой поток радара (как dump_radar.py)
-    radar_times.csv     смещение в байтах → время (с от старта) — по нему кадры радара привязываются к видео
-    meta.json           параметры: порты, разрешение, FPS, расстояние радар–камера
+Exit — the q key in the camera window, or Ctrl+C. Output: folder rec_<time>/ :
+    camera.mp4          video from the camera
+    camera_times.csv    frame number -> recording time (s from start)
+    radar.bin           raw radar stream (same as dump_radar.py)
+    radar_times.csv     byte offset -> time (s from start) — used to align radar frames with the video
+    meta.json           parameters: ports, resolution, FPS, radar-camera distance
 
-Ничего не анализирует — только пишет. Обработка потом: fusion.py --video ... --dump ...
+Does no analysis — only records. Processing happens later: fusion.py --video ... --dump ...
 """
 import csv
 import json
@@ -25,16 +25,16 @@ try:
 except ImportError:
     serial = None
 
-# ---------------------------------------------------------------- НАСТРОЙКИ
-CAMERA_INDEX = 0            # 0 — встроенная камера; 1 — внешняя USB
+# ---------------------------------------------------------------- SETTINGS
+CAMERA_INDEX = 0            # 0 — built-in camera; 1 — external USB
 CAM_WIDTH, CAM_HEIGHT = 640, 480
-CLI_PORT = "COM5"           # командный порт (User UART)
-DATA_PORT = "COM6"          # порт данных (Auxiliary)
+CLI_PORT = "COM5"           # command port (User UART)
+DATA_PORT = "COM6"          # data port (Auxiliary)
 CFG_FILE = "profile_sdk3.cfg"
-SEND_CFG = True             # False, если радар уже стримит
-RADAR_TO_CAMERA_CM = {"right": 0.0, "up": 0.0, "forward": 0.0}   # где радар относительно объектива камеры
-MAX_SECONDS = 600           # предохранитель: остановиться через 10 минут
-SHOW_PREVIEW = True         # False — без окна (Jupyter / headless); остановка: файл STOP в папке запуска или MAX_SECONDS
+SEND_CFG = True             # False if the radar is already streaming
+RADAR_TO_CAMERA_CM = {"right": 0.0, "up": 0.0, "forward": 0.0}   # where the radar is relative to the camera lens
+MAX_SECONDS = 600           # safety net: stop after 10 minutes
+SHOW_PREVIEW = True         # False — no window (Jupyter / headless); stop via a STOP file in the launch folder or MAX_SECONDS
 
 OUT_DIR = f"rec_{datetime.now():%Y%m%d_%H%M%S}"
 MAGIC = b"\x02\x01\x04\x03\x06\x05\x08\x07"
@@ -47,18 +47,18 @@ def send_config():
             if line and not line.startswith("%"):
                 ser.write((line + "\n").encode())
                 time.sleep(0.05)
-    print("✓ конфиг отправлен в", CLI_PORT)
+    print("✓ config sent to", CLI_PORT)
 
 
 def radar_writer(stop, clock, out_dir, stats):
-    """Пишет байты из порта данных в radar.bin и время каждого куска в radar_times.csv."""
+    """Writes bytes from the data port to radar.bin and the time of each chunk to radar_times.csv."""
     with serial.Serial(DATA_PORT, 921600, timeout=0.01) as ser, \
          open(os.path.join(out_dir, "radar.bin"), "wb") as fb, \
          open(os.path.join(out_dir, "radar_times.csv"), "w", newline="") as ft:
         w = csv.writer(ft); w.writerow(["byte_offset", "t_s"])
         offset = 0
         while not stop.is_set():
-            chunk = ser.read(max(1, ser.in_waiting))     # короткие чтения: метка времени ±10 мс, не ±100
+            chunk = ser.read(max(1, ser.in_waiting))     # short reads: timestamp ±10 ms, not ±100
             if chunk:
                 t = clock()
                 fb.write(chunk)
@@ -66,7 +66,7 @@ def radar_writer(stop, clock, out_dir, stats):
                 offset += len(chunk)
                 stats["radar_bytes"] = offset
                 stats["radar_frames"] += chunk.count(MAGIC)
-    print("радар: остановлен")
+    print("radar: stopped")
 
 
 def main():
@@ -75,15 +75,15 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
     if not cap.isOpened():
-        raise SystemExit(f"камера {CAMERA_INDEX} не открылась")
+        raise SystemExit(f"camera {CAMERA_INDEX} did not open")
     ok, frame = cap.read()
     if not ok:
-        raise SystemExit("камера не отдаёт кадры")
+        raise SystemExit("camera is not returning frames")
     h, w = frame.shape[:2]
     fps_nominal = cap.get(cv2.CAP_PROP_FPS)
     if not fps_nominal or fps_nominal <= 0 or fps_nominal > 120:
-        fps_nominal = 30.0                            # камера не сообщает fps (бывает -1) — иначе VideoWriter не пишет
-    print(f"камера: {w}x{h} @ {fps_nominal:.0f} fps (номинал)")
+        fps_nominal = 30.0                            # camera doesn't report fps (sometimes -1) — otherwise VideoWriter won't write
+    print(f"camera: {w}x{h} @ {fps_nominal:.0f} fps (nominal)")
 
     if serial is None:
         raise SystemExit("pip install pyserial")
@@ -91,7 +91,7 @@ def main():
         try:
             send_config()
         except Exception as e:
-            print(f"⚠️ конфиг не отправлен ({e}) — если радар уже стримит, нормально")
+            print(f"⚠️ config not sent ({e}) — fine if the radar is already streaming")
 
     t_start = time.perf_counter()
     clock = lambda: time.perf_counter() - t_start
@@ -102,16 +102,16 @@ def main():
 
     writer = cv2.VideoWriter(os.path.join(OUT_DIR, "camera.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), fps_nominal, (w, h))
     if not writer.isOpened():
-        raise SystemExit("VideoWriter не открылся — проверьте кодек mp4v / права на папку")
+        raise SystemExit("VideoWriter did not open — check the mp4v codec / folder permissions")
     ft = open(os.path.join(OUT_DIR, "camera_times.csv"), "w", newline="")
     wt = csv.writer(ft); wt.writerow(["frame", "t_s"])
     n = 0
     global SHOW_PREVIEW
-    print(f"=== запись в {OUT_DIR}/ · q в окне, файл STOP или Ctrl+C — стоп ===")
+    print(f"=== recording to {OUT_DIR}/ · q in the window, a STOP file, or Ctrl+C — stop ===")
     try:
         while clock() < MAX_SECONDS:
             ok, frame = cap.read()
-            t = clock()                                   # время сразу после получения кадра
+            t = clock()                                   # time right after getting the frame
             if not ok:
                 continue
             writer.write(frame)
@@ -128,7 +128,7 @@ def main():
                     if (cv2.waitKey(1) & 0xFF) == ord("q"):
                         break
                 except cv2.error:
-                    SHOW_PREVIEW = False              # OpenCV без GUI (headless) — пишем без окна
+                    SHOW_PREVIEW = False              # OpenCV without GUI (headless) — record without a window
             elif n % 30 == 0:
                 print(f"REC {t:6.1f}s  cam {n}  radar frames {stats['radar_frames']}", flush=True)
             if os.path.exists("STOP"):
@@ -149,9 +149,9 @@ def main():
                    "duration_s": round(dur, 2), "cli_port": CLI_PORT, "data_port": DATA_PORT,
                    "cfg_file": CFG_FILE, "radar_to_camera_cm": RADAR_TO_CAMERA_CM},
                   open(os.path.join(OUT_DIR, "meta.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
-        print(f"\nготово: {dur:.1f} с · кадров камеры {n} ({n / max(dur, 1e-3):.1f} fps) · "
-              f"кадров радара {stats['radar_frames']} ({stats['radar_frames'] / max(dur, 1e-3):.1f} fps)")
-        print(f"папка {OUT_DIR}/ — заархивировать и прислать целиком")
+        print(f"\ndone: {dur:.1f} s · camera frames {n} ({n / max(dur, 1e-3):.1f} fps) · "
+              f"radar frames {stats['radar_frames']} ({stats['radar_frames'] / max(dur, 1e-3):.1f} fps)")
+        print(f"folder {OUT_DIR}/ — zip it up and send the whole thing")
 
 
 if __name__ == "__main__":

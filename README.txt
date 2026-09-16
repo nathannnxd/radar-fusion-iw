@@ -1,35 +1,35 @@
-Радар IWR1642 + камера: запись и слияние
+IWR1642 radar + camera: recording and fusion
 =========================================
-Все файлы — в одну папку. Порты COM5 (команды) / COM6 (данные), конфиг profile_sdk3.cfg — уже прописаны.
+All files go in one folder. Ports COM5 (commands) / COM6 (data), config profile_sdk3.cfg — already set up.
 
-Установка:  pip install pyserial opencv-python numpy pandas scikit-learn ultralytics
+Install:  pip install pyserial opencv-python numpy pandas scikit-learn ultralytics
 
-1) Запись (камера + радар, общие часы):        python record_sync.py
-   -> папка rec_<время>/  (camera.mp4, radar.bin, метки времени, meta.json)
-   Стоп: q в окне, или файл STOP в папке запуска, или MAX_SECONDS.
-   Из Jupyter: SHOW_PREVIEW = False.
+1) Record (camera + radar, shared clock):        python record_sync.py
+   -> folder rec_<time>/  (camera.mp4, radar.bin, timestamps, meta.json)
+   Stop: q in the window, or a STOP file in the launch folder, or MAX_SECONDS.
+   From Jupyter: SHOW_PREVIEW = False.
 
-2) Слияние по записи (видео + радар -> fused.mp4, fusion.csv):
-                                                python fusion_offline.py rec_<время> [--meters 8]
-   Имитации потери камеры для проверки удержания: --blind 14,26 (дым) | --miss 14,26 (промах) | --occlude 14,26 (лист)
-   Детектор с открытым словарём (банка, трактор): --detector yolo-world  (первый запуск качает ~340 МБ)
+2) Fuse a recording (video + radar -> fused.mp4, fusion.csv):
+                                                python fusion_offline.py rec_<time> [--meters 8]
+   Simulate camera loss to test hold-tracking: --blind 14,26 (haze) | --miss 14,26 (miss) | --occlude 14,26 (sheet)
+   Open-vocabulary detector (can, tractor): --detector yolo-world  (first run downloads ~340 MB)
 
-3) Живой режим (камера + радар в реальном времени, два окна):
+3) Live mode (camera + radar in real time, two windows):
                                                 python fusion.py
-   Самопроверка без камеры:                     python fusion.py --selftest --dump <дамп.bin>
+   Self-test without a camera:                  python fusion.py --selftest --dump <dump.bin>
 
-4) Только радар, живое окно / по дампу:         python iwr1642_live.py   (DUMP_FILE в шапке)
-5) Сырой дамп радара:                           python dump_radar.py --sec 10
+4) Radar only, live window / from a dump:       python iwr1642_live.py   (DUMP_FILE at the top)
+5) Raw radar dump:                              python dump_radar.py --sec 10
 
-Файлы:
-  record_sync.py    запись
-  fusion_offline.py слияние по папке записи
-  fusion.py         слияние живьём + самопроверка; логика сопоставления и калибровки
-  iwr1642_live.py   радар: разбор TLV, точки, карта фона, треки (EKF), отрисовка, контракт /radar/tracks
-  dump_radar.py     запись сырого потока радара в .bin
-  profile_sdk3.cfg  конфиг радара под прошивку SDK 3.x (9 м, ±1 м/с — комнатный; для поля нужен другой)
+Files:
+  record_sync.py    recording
+  fusion_offline.py fusion over a recorded folder
+  fusion.py         live fusion + self-test; matching and calibration logic
+  iwr1642_live.py   radar: TLV parsing, points, background map, tracks (EKF), rendering, /radar/tracks contract
+  dump_radar.py     records the raw radar stream to .bin
+  profile_sdk3.cfg  radar config for SDK 3.x firmware (9 m, ±1 m/s — indoor; a different one is needed for the field)
 
-Состояния объекта на видео: зелёная рамка — камера+радар; голубая — камера потеряла, ведёт радар
-(подпись: причина — occluded / haze / detector miss); пунктир — радар тоже без измерения; красный кружок —
-движущийся радар без пары. Число на рамке — дальность до ближней точки объекта (радар).
-RADAR_TO_CAMERA_CM в record_sync.py (где плата относительно объектива) — используется при слиянии (параллакс).
+Object states on the video: green box — camera+radar; cyan — camera lost it, radar is holding it
+(label: reason — occluded / haze / detector miss); dashed — radar also has no measurement; red circle —
+moving radar with no pair. The number on the box is the range to the nearest point of the object (radar).
+RADAR_TO_CAMERA_CM in record_sync.py (where the board sits relative to the lens) — used during fusion (parallax).
