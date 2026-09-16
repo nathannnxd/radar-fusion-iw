@@ -23,6 +23,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath('E:\Kuliah\Skoltech - Engineering Systems\Innovation Workshops\fusion\radar_pack')))
 import iwr1642_live as radar
 import fusion as F
+import radar_filter
 
 
 def radar_frames_with_time(rec):
@@ -106,8 +107,9 @@ def main():
         while ri < len(rframes) and rframes[ri]["t"] <= t:                   # radar up to this moment
             fr = rframes[ri]; ri += 1
             out = pipe.process(fr)
-            fused, dets, matched = fus.on_radar(fr["t"], fr["frame"], out["tracks"])
-            latest.update(fused=fused, dets=dets, matched=matched, tracks=out["tracks"], rdets=out["dets"], rkinds=out["kinds"])
+            filtered = radar_filter.sync_and_filter(out["tracks"], t - fr["t"])
+            fused, dets, matched = fus.on_radar(fr["t"], fr["frame"], filtered)
+            latest.update(fused=fused, dets=dets, matched=matched, tracks=filtered, rdets=out["dets"], rkinds=out["kinds"])
             stats["radar_frames"] += 1
             stats["matched_frames"] += any(f["matched_now"] for f in fused)
             stats["confirmed_frames"] += any(f["cam_id"] is not None for f in fused)

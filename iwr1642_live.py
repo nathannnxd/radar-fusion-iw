@@ -376,12 +376,17 @@ class Track:
         self.t_created, self.t_updated = t, t
         self.range_hist = [(t, obj["range_m"])]              # for resolving Doppler ambiguity from positions
 
-    def predict(self, dt):
+    @staticmethod
+    def step_state(x, P, dt, a=2.5):
+        """Constant-acceleration EKF predict, out-of-place. a: process noise, acceleration ~2.5 m/s²
+        (maneuvers, turns). Reused by predict() (mutating) and by radar_filter.py (non-mutating,
+        to extrapolate a track to an arbitrary sync time without disturbing the live tracker)."""
         F = np.array([[1, 0, dt, 0], [0, 1, 0, dt], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=float)
-        a = 2.5                                           # process noise: acceleration ~2.5 m/s² (maneuvers, turns)
         G = np.array([[0.5 * dt * dt, 0], [0, 0.5 * dt * dt], [dt, 0], [0, dt]])
-        self.x = F @ self.x
-        self.P = F @ self.P @ F.T + G @ G.T * a * a
+        return F @ x, F @ P @ F.T + G @ G.T * a * a
+
+    def predict(self, dt):
+        self.x, self.P = self.step_state(self.x, self.P, dt)
         self.age += 1
 
     def _h(self, x):

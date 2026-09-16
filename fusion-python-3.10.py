@@ -25,6 +25,7 @@ from typing import Optional
 import numpy as np
 
 import iwr1642_live as radar
+import radar_filter
 
 try:
     import cv2
@@ -232,10 +233,14 @@ class Fusion:
         with self.lock:
             self.cam_buf.append((t, dets, gray))
 
-    def _nearest_camera(self, t):
+    def nearest_camera_t(self, t):
         with self.lock:
             best = min(self.cam_buf, key=lambda it: abs(it[0] - t), default=None)
-        if best is None or abs(best[0] - t) > MAX_DT_S:
+        return best if best is not None and abs(best[0] - t) <= MAX_DT_S else None
+
+    def _nearest_camera(self, t):
+        best = self.nearest_camera_t(t)
+        if best is None:
             return None, None, None
         return best[1], best[0] - t, best[2]
 
@@ -579,10 +584,14 @@ def run_live(dump=None):
                         t_next = clock() if t_next is None else t_next + period
                         while clock() < t_next:
                             time.sleep(0.005)
+                    t_now = clock()
                     out = pipe.process(fr)
-                    fused, dets, matched = fus.on_radar(clock(), fr["frame"], out["tracks"])
-                    state["snap"] = {"t": clock(), "fused": fused, "dets": dets, "matched": matched,
-                                     "tracks": out["tracks"], "rdets": out["dets"], "rkinds": out["kinds"]}
+                    best = fus.nearest_camera_t(t_now)
+                    dt_sync = (best[0] - t_now) if best is not None else 0.0
+                    filtered = radar_filter.sync_and_filter(out["tracks"], dt_sync)
+                    fused, dets, matched = fus.on_radar(t_now, fr["frame"], filtered)
+                    state["snap"] = {"t": t_now, "fused": fused, "dets": dets, "matched": matched,
+                                     "tracks": filtered, "rdets": out["dets"], "rkinds": out["kinds"]}
         except BaseException as e:                               # a thread dying shouldn't be silent
             state["error"] = f"{type(e).__name__}: {e}"
             print("RADAR STOPPED:", state["error"], flush=True)
@@ -637,8 +646,9 @@ def selftest(dump, true_yaw_deg=4.0, seed=0, verbose=True):
     for k, fr in enumerate(frames):
         out = pipe.process(fr)
         t = out["t"]
+        tracks = radar_filter.sync_and_filter(out["tracks"], 0.0)
         dets = []
-        for tr in out["tracks"]:
+        for tr in tracks:
             if tr.range_m < 0.7 or rng.random() < 0.2:
                 continue
             az, _ = truth_cam.cam_view(float(tr.x[0]), float(tr.x[1]))
@@ -650,9 +660,10 @@ def selftest(dump, true_yaw_deg=4.0, seed=0, verbose=True):
         if rng.random() < 0.15:
             dets.append(CamDet(t, 999, "car", 0.5, 100, 300, 260, 420, 1.5))
         fus.push_camera(t, dets)
-        fused, cam_dets, matched = fus.on_radar(t, fr["frame"], out["tracks"])
+        fused, cam_dets, matched = fus.on_radar(t, fr["frame"], tracks)
         stats["radar_frames"] += 1
         stats["tracks"] += len(out["tracks"])
+        stats["rejected"] += len(out["tracks"]) - len(tracks)
         stats["matched_now"] += sum(1 for f in fused if f["matched_now"])
         stats["fused_confirmed"] += sum(1 for f in fused if f["cam_id"] is not None)
         stats["class_person"] += sum(1 for f in fused if f["fused_class"] == "person")
@@ -666,6 +677,7 @@ def selftest(dump, true_yaw_deg=4.0, seed=0, verbose=True):
     df = pd.read_csv(csv_path)
     dup = df[df.radar_id.notna()].duplicated(subset=["radar_frame", "radar_id"]).sum()
     res = {"radar_frames": stats["radar_frames"], "total_tracks (frame-tracks)": stats["tracks"],
+           "rejected_tracks (frame-tracks)": stats["rejected"],
            "matched_with_camera_now": stats["matched_now"], "confirmed (frame-tracks)": stats["fused_confirmed"],
            "got_class_person": stats["class_person"], "duplicates_absorbed (frame-tracks)": stats["absorbed"],
            "true_yaw": true_yaw_deg, "yaw_estimate_at_frame_40": round(stats["yaw_est_at_40"], 2),
