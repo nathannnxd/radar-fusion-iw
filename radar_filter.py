@@ -13,6 +13,8 @@ tracker's own tuned process noise.
 """
 import copy
 
+import numpy as np
+
 import iwr1642_live as radar
 
 # ---------------------------------------------------------------- SETTINGS
@@ -33,8 +35,15 @@ def sync_and_filter(tracks, dt):
     for tr in tracks:
         if tr.misses > REJECT_MAX_MISSES:
             continue
+        # a NaN/Inf state (e.g. a cluster built from a point with corrupted/missing side-info)
+        # compares False against every threshold below, so it must be caught explicitly —
+        # it won't trip sigma_xy_m/speed_mps on its own.
+        if not (np.all(np.isfinite(tr.x)) and np.all(np.isfinite(tr.P))):
+            continue
         synced = copy.copy(tr)
         synced.x, synced.P = radar.Track.step_state(tr.x, tr.P, dt)
+        if not (np.all(np.isfinite(synced.x)) and np.all(np.isfinite(synced.P))):
+            continue
         if synced.sigma_xy_m > REJECT_SIGMA_XY_M or synced.speed_mps > REJECT_SPEED_MPS:
             continue
         out.append(synced)

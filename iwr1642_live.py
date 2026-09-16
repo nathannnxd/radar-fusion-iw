@@ -335,7 +335,9 @@ def cluster_objects(dets, kinds, confs, eps_m=CLUSTER_EPS_M, v_weight=CLUSTER_V_
         if lab == -1:
             continue
         mem = [idx[j] for j in range(len(idx)) if labels[j] == lab]
-        w = np.array([max(dets[i]["snr_db"], 1.0) for i in mem])           # weights by SNR
+        # weights by SNR; a point whose side-info TLV entry is missing (snr_db = NaN, see
+        # points_to_detections) gets a neutral weight instead of poisoning the weighted centroid
+        w = np.array([max(dets[i]["snr_db"], 1.0) if math.isfinite(dets[i]["snr_db"]) else 1.0 for i in mem])
         cx = float(np.average([dets[i]["x_m"] for i in mem], weights=w))
         cy = float(np.average([dets[i]["y_m"] for i in mem], weights=w))
         votes = defaultdict(float)
