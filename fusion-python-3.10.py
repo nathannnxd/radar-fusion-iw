@@ -13,6 +13,7 @@
 #  Radar — via iwr1642_live only (tracks with IDs). No custom TLV parsing here.
 # =====================================================================
 import argparse
+import os
 import csv
 import math
 import threading
@@ -37,7 +38,7 @@ except ImportError:
 
 # ---------------------------------------------------------------- SETTINGS
 CAMERA_INDEX = 0
-DETECTOR = "yolov8n"       # "yolov8n" — COCO, fast; "yolo-world" — open vocabulary (WORLD_CLASSES),
+DETECTOR = "yolo-world"       # "yolov8n" — COCO, fast; "yolo-world" — open vocabulary (WORLD_CLASSES),
                            # first run downloads weights + CLIP (~340 MB), ~0.25 s/frame on CPU
 YOLO_WEIGHTS = {"yolov8n": "yolov8n.pt", "yolo-world": "yolov8s-worldv2.pt"}
 YOLO_CONF = 0.4
@@ -66,7 +67,8 @@ MERGE_DV_MPS = 0.8         # ...with a similar speed (wraparound-aware) and the 
 SHOW_ONLY_INTERESTING = True
 MOVING_MPS = 0.25
 RADAR_STALE_S = 0.5        # radar hasn't updated for this long — consider it lost (banner, tracks not drawn)
-CSV_PATH = f"fusion_{datetime.now():%Y%m%d_%H%M%S}.csv"
+CSV_FOLDER = "logs"
+CSV_PATH = os.path.join(CSV_FOLDER, f"fusion_{datetime.now():%Y%m%d_%H%M%S}.csv")
 SHOW_WINDOW = True
 
 Q_SHARP_DROP = 0.45        # sharpness below 45 % of the reference
