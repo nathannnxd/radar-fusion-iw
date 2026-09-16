@@ -1,6 +1,6 @@
 IWR1642 radar + camera: recording and fusion
 =========================================
-All files go in one folder. Ports COM5 (commands) / COM6 (data), config profile_sdk3.cfg — already set up.
+All files go in one folder. Default: Ports COM5 (commands) / COM6 (data), config config-16.09.26-12.43.cfg.
 
 Install:  pip install pyserial opencv-python numpy pandas scikit-learn ultralytics
 

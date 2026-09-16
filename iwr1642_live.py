@@ -37,9 +37,9 @@ except ImportError:
     DBSCAN = None
 
 # ---------------------------------------------------------------- SETTINGS
-CLI_PORT = "COM5"          # XDS110 Class Application/User UART
-DATA_PORT = "COM6"         # XDS110 Class Auxiliary Data Port
-CFG_FILE = "profile_sdk3.cfg"
+CLI_PORT = "COM6"          # XDS110 Class Application/User UART
+DATA_PORT = "COM7"         # XDS110 Class Auxiliary Data Port
+CFG_FILE = "configs/config-16.09.26-12.43.cfg"
 MODEL_PATH = "radar_lightgbm_model.pkl"   # our own .pkl; the /content/drive/... path doesn't exist on the laptop
 DUMP_FILE = None           # "radar_dump.bin" — replay a recording without ports
 SEND_CFG = True            # False if the radar is already streaming (e.g. started from Visualizer)
