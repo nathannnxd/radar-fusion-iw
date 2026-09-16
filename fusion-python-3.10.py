@@ -38,7 +38,7 @@ except ImportError:
     YOLO = None
 
 # ---------------------------------------------------------------- SETTINGS
-CAMERA_INDEX = 0
+CAMERA_INDEX = 1            # 0 — built-in camera; 1 — external USB
 DETECTOR = "yolo-world"       # "yolov8n" — COCO, fast; "yolo-world" — open vocabulary (WORLD_CLASSES),
                            # first run downloads weights + CLIP (~340 MB), ~0.25 s/frame on CPU
 YOLO_WEIGHTS = {"yolov8n": "yolov8n.pt", "yolo-world": "yolov8s-worldv2.pt"}

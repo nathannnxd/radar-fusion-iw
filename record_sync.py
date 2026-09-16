@@ -26,7 +26,7 @@ except ImportError:
     serial = None
 
 # ---------------------------------------------------------------- SETTINGS
-CAMERA_INDEX = 0            # 0 — built-in camera; 1 — external USB
+CAMERA_INDEX = 1            # 0 — built-in camera; 1 — external USB
 CAM_WIDTH, CAM_HEIGHT = 640, 480
 CLI_PORT = "COM5"           # command port (User UART)
 DATA_PORT = "COM6"          # data port (Auxiliary)
