@@ -1,0 +1,8 @@
+{
+    "CLI_PORT": "COM6",
+    "DATA_PORT": "COM7",
+    "DETECTOR": "yolo-world",
+    "SHOW_FPS": 1,
+    "CAMERA_INDEX": 1,
+    "RADAR_CONFIG": "radar_configs/config-16.09.26-12.43.cfg"
+}

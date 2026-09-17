@@ -18,6 +18,7 @@ import csv
 import math
 import threading
 import time
+import json
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -37,41 +38,48 @@ try:
 except ImportError:
     YOLO = None
 
+with open("configs.json", "r") as file:
+    code_config = json.load(file)            # Read/edit configs.json
 # ---------------------------------------------------------------- SETTINGS
-CAMERA_INDEX = 1            # 0 — built-in camera; 1 — external USB
-DETECTOR = "yolo-world"       # "yolov8n" — COCO, fast; "yolo-world" — open vocabulary (WORLD_CLASSES),
-                           # first run downloads weights + CLIP (~340 MB), ~0.25 s/frame on CPU
+CAMERA_INDEX = code_config["CAMERA_INDEX"]   # 0 — built-in camera; 1 — external USB
+DETECTOR = code_config["DETECTOR"]           # "yolov8n" — COCO, fast; "yolo-world" — open vocabulary (WORLD_CLASSES),
+                                             # first run downloads weights + CLIP (~340 MB), ~0.25 s/frame on CPU
 YOLO_WEIGHTS = {"yolov8n": "yolov8n.pt", "yolo-world": "yolov8s-worldv2.pt"}
 YOLO_CONF = 0.4
-YOLO_KEEP = {0: ("person", 1.70), 1: ("bicycle", 1.10), 2: ("car", 1.50), 3: ("motorcycle", 1.20),
-             5: ("bus", 3.00), 7: ("truck", 3.00), 16: ("dog", 0.55), 17: ("horse", 1.60),
-             18: ("sheep", 0.90), 19: ("cow", 1.40), 39: ("bottle", 0.25), 41: ("cup", 0.12)}
-WORLD_CLASSES = {"person": 1.70, "car": 1.50, "truck": 3.00, "tractor": 2.80, "dog": 0.55, "cow": 1.40,
-                 "aluminum can": 0.12, "bottle": 0.25, "chair": 0.90, "pole": 2.00, "box": 0.40}
+#YOLO_KEEP = {0: ("person", 1.70), 1: ("bicycle", 1.10), 2: ("car", 1.50), 3: ("motorcycle", 1.20),
+#             5: ("bus", 3.00), 7: ("truck", 3.00), 16: ("dog", 0.55), 17: ("horse", 1.60),
+#             18: ("sheep", 0.90), 19: ("cow", 1.40), 39: ("bottle", 0.25), 41: ("cup", 0.12)}
+#WORLD_CLASSES = {"person": 1.70, "car": 1.50, "truck": 3.00, "tractor": 2.80, "dog": 0.55, "cow": 1.40,
+#                 "aluminum can": 0.12, "bottle": 0.25, "chair": 0.90, "pole": 2.00, "box": 0.40}
 
-CAM_HFOV_DEG = 70.0        # camera horizontal field of view
-CAM_YAW_DEG = 0.0          # yaw = radar_azimuth − camera_azimuth for the same object (median over pairs);
-                           # positive if the radar axis is rotated LEFT of the camera axis. Refined by calibration.
-RADAR_TO_CAMERA_M = {"right": 0.0, "up": 0.0, "forward": 0.0}   # where the radar is relative to the lens; read from meta.json
-MAX_DT_S = 0.15            # allowed desync between camera and radar frames
-AZ_SIGMA_DEG = 4.0         # expected azimuth error between sensors
-RANGE_REL_SIGMA = 0.35     # relative range error from bbox height (±35 %)
-CLIPPED_RANGE_SIGMA = 1.2  # ...if the bbox hits the frame edge — height is clipped, range is only an upper bound
-GATE = 3.0                 # matching threshold in sigmas
-HISTORY_BONUS = 1.0        # cost discount if a detection with the same cam_id already matched this track
-PAIR_CONFIRM = 5           # matches needed for a track to become an "object with a class"
-FORGET_S = 2.0             # track memory without radar — this many seconds
-HOLD_MAX_S = 30.0          # camera lost the object, radar is tracking: how many seconds to hold the box
-HOLD_FOV_MARGIN_DEG = 8.0  # object is "in frame" if azimuth is within FOV with margin ≥ 2·AZ_SIGMA
-MERGE_DIST_M = 0.9         # an unpaired radar track closer than this to an object...
-MERGE_DV_MPS = 0.8         # ...with a similar speed (wraparound-aware) and the same azimuth — is part of it, not a separate object
+# DETECT HUMAN ONLY
+YOLO_KEEP = {0: ("person", 1.70)}
+WORLD_CLASSES = {"person": 1.70}
+
+CAM_HFOV_DEG = 70.0                  # camera horizontal field of view
+CAM_YAW_DEG = 0.0                    # yaw = radar_azimuth − camera_azimuth for the same object (median over pairs);
+                                     # positive if the radar axis is rotated LEFT of the camera axis. Refined by calibration.
+RADAR_TO_CAMERA_M = {"right": 0.0,\
+                     "up": 0.0, "forward": 0.0}   # where the radar is relative to the lens; read from meta.json
+MAX_DT_S = 0.15                      # allowed desync between camera and radar frames
+AZ_SIGMA_DEG = 4.0                   # expected azimuth error between sensors
+RANGE_REL_SIGMA = 0.35               # relative range error from bbox height (±35 %)
+CLIPPED_RANGE_SIGMA = 1.2            # ...if the bbox hits the frame edge — height is clipped, range is only an upper bound
+GATE = 3.0                           # matching threshold in sigmas
+HISTORY_BONUS = 1.0                  # cost discount if a detection with the same cam_id already matched this track
+PAIR_CONFIRM = 5                     # matches needed for a track to become an "object with a class"
+FORGET_S = 2.0                       # track memory without radar — this many seconds
+HOLD_MAX_S = 30.0                    # camera lost the object, radar is tracking: how many seconds to hold the box
+HOLD_FOV_MARGIN_DEG = 8.0            # object is "in frame" if azimuth is within FOV with margin ≥ 2·AZ_SIGMA
+MERGE_DIST_M = 0.9                   # an unpaired radar track closer than this to an object...
+MERGE_DV_MPS = 0.8                   # ...with a similar speed (wraparound-aware) and the same azimuth — is part of it, not a separate object
 SHOW_ONLY_INTERESTING = True
 MOVING_MPS = 0.25
-RADAR_STALE_S = 0.5        # radar hasn't updated for this long — consider it lost (banner, tracks not drawn)
+RADAR_STALE_S = 0.5                  # radar hasn't updated for this long — consider it lost (banner, tracks not drawn)
 CSV_FOLDER = "logs"
 CSV_PATH = os.path.join(CSV_FOLDER, f"fusion_{datetime.now():%Y%m%d_%H%M%S}.csv")
 SHOW_WINDOW = True
-SHOW_FPS = 1               # 1 — draw the fps counter on the radar/fusion displays; 0 — off
+SHOW_FPS = code_config["SHOW_FPS"]   # 1 — draw the fps counter on the radar/fusion displays; 0 — off
 
 Q_SHARP_DROP = 0.45        # sharpness below 45 % of the reference
 Q_CONTRAST_DROP = 0.45     # contrast below 45 % of the reference

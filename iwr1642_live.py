@@ -36,30 +36,32 @@ try:
 except ImportError:
     DBSCAN = None
 
+with open("configs.json", "r") as file:
+    code_config = json.load(file)            # Read/edit configs.json
 # ---------------------------------------------------------------- SETTINGS
-CLI_PORT = "COM6"          # XDS110 Class Application/User UART
-DATA_PORT = "COM7"         # XDS110 Class Auxiliary Data Port
-CFG_FILE = "configs/config-16.09.26-12.43.cfg"
-MODEL_PATH = "radar_lightgbm_model.pkl"   # our own .pkl; the /content/drive/... path doesn't exist on the laptop
-DUMP_FILE = None           # "radar_dump.bin" — replay a recording without ports
-SEND_CFG = True            # False if the radar is already streaming (e.g. started from Visualizer)
-EGO_SPEED_MPS = 0.0        # carrier speed, m/s; 0 on the bench, from odometry on the tractor
-SHOW_WINDOW = True         # OpenCV window
-SHOW_FPS = 1               # 1 — draw the fps counter on the display; 0 — off
-DRAW_METERS = 15           # image radius, m: 10 for a room, 30–50 for a field
-LOG_JSONL = True           # write frames and tracks to frames_<time>.jsonl
+CLI_PORT = code_config["CLI_PORT"]           # XDS110 Class Application/User UART
+DATA_PORT = code_config["DATA_PORT"]         # XDS110 Class Auxiliary Data Port
+CFG_FILE = code_config["RADAR_CONFIG"]
+MODEL_PATH = "radar_lightgbm_model.pkl"      # our own .pkl; the /content/drive/... path doesn't exist on the laptop
+DUMP_FILE = None                             # "radar_dump.bin" — replay a recording without ports
+SEND_CFG = True                              # False if the radar is already streaming (e.g. started from Visualizer)
+EGO_SPEED_MPS = 0.0                          # carrier speed, m/s; 0 on the bench, from odometry on the tractor
+SHOW_WINDOW = True                           # OpenCV window
+SHOW_FPS = code_config["SHOW_FPS"]           # 1 — draw the fps counter on the display; 0 — off
+DRAW_METERS = 15                             # image radius, m: 10 for a room, 30–50 for a field
+LOG_JSONL = True                             # write frames and tracks to frames_<time>.jsonl
 
-MIN_RANGE_M = 0.5          # closer than this — antenna leakage / housing (in both dumps a point at 0–0.5 m with SNR 27 dB)
-STATIC_DOPPLER_MPS = 0.12  # |Doppler after ego compensation| below this — the point is stationary
-USE_BACKGROUND = True      # background map: learns for the first BACKGROUND_LEARN_S seconds, only while ego ≈ 0
+MIN_RANGE_M = 0.5                            # closer than this — antenna leakage / housing (in both dumps a point at 0–0.5 m with SNR 27 dB)
+STATIC_DOPPLER_MPS = 0.12                    # |Doppler after ego compensation| below this — the point is stationary
+USE_BACKGROUND = True                        # background map: learns for the first BACKGROUND_LEARN_S seconds, only while ego ≈ 0
 BACKGROUND_LEARN_S = 3.0
 BACKGROUND_CELL_M = 0.25
-BACKGROUND_MIN_OCCUPANCY = 0.4   # a cell is background if occupied by a static point in ≥40 % of the learning frames
-CLUSTER_EPS_M = 0.7        # cluster radius in (x, y, v·CLUSTER_V_WEIGHT)
-CLUSTER_V_WEIGHT = 0.7     # 1 m/s of speed difference ≈ 0.7 m of distance → different objects
-TRACK_CONFIRM_HITS = 3     # hits needed for a candidate to become a track
-TRACK_CONFIRM_WINDOW = 5   # ...within this many first frames
-TRACK_MAX_MISSES = 10      # frames without a measurement a track survives on prediction (1 s at 10 Hz)
+BACKGROUND_MIN_OCCUPANCY = 0.4               # a cell is background if occupied by a static point in ≥40 % of the learning frames
+CLUSTER_EPS_M = 0.7                          # cluster radius in (x, y, v·CLUSTER_V_WEIGHT)
+CLUSTER_V_WEIGHT = 0.7                       # 1 m/s of speed difference ≈ 0.7 m of distance → different objects
+TRACK_CONFIRM_HITS = 3                       # hits needed for a candidate to become a track
+TRACK_CONFIRM_WINDOW = 5                     # ...within this many first frames
+TRACK_MAX_MISSES = 10                        # frames without a measurement a track survives on prediction (1 s at 10 Hz)
 
 MAGIC = b"\x02\x01\x04\x03\x06\x05\x08\x07"
 HEADER_LEN = 40
