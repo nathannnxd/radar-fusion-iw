@@ -458,11 +458,13 @@ def _dashed_rect(img, p1, p2, color, thick=2, dash=12):
                      (int(ax + (bx - ax) * s1), int(ay + (by - ay) * s1)), color, thick)
 
 
-def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, radar_stale=False):
+def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, radar_stale=False, fps=None):
     """Green box — both sensors; cyan — camera lost it, radar is tracking (dashed — radar on prediction);
     thin orange — camera only (range from bbox height, "≤" if the box is clipped by the edge);
     red circle — moving radar with no pair. The number on the box is the range to the nearest point (radar)."""
     img = frame.copy()
+    if fps is not None:
+        _range_label(img, cam.w - 130, 26, f"{fps:4.1f} fps", (200, 200, 200), 0.55)
     if radar_stale:
         _range_label(img, 8, 30, "RADAR LOST / STALE — camera only", (0, 60, 255), 0.7)
         fused = []
@@ -560,7 +562,7 @@ def run_live(dump=None):
     yolo, keep = load_detector()
     t_start = time.time()
     clock = lambda: time.time() - t_start
-    snap = {"t": -1e9, "fused": [], "dets": [], "matched": {}, "tracks": [], "rdets": [], "rkinds": []}
+    snap = {"t": -1e9, "fused": [], "dets": [], "matched": {}, "tracks": [], "rdets": [], "rkinds": [], "radar_fps": 0.0}
     state = {"snap": snap, "error": None}
     stop = threading.Event()
 
@@ -569,6 +571,7 @@ def run_live(dump=None):
             buffer = b""
             period = cfg.get("frame_period_s") or 0.1
             t_next = None
+            radar_fps = radar.FpsMeter()
             for chunk in radar.byte_source():
                 if stop.is_set():
                     break
@@ -588,18 +591,21 @@ def run_live(dump=None):
                             time.sleep(0.005)
                     t_now = clock()
                     out = pipe.process(fr)
+                    radar_fps.tick()
                     best = fus.nearest_camera_t(t_now)
                     dt_sync = (best[0] - t_now) if best is not None else 0.0
                     filtered = radar_filter.sync_and_filter(out["tracks"], dt_sync)
                     fused, dets, matched = fus.on_radar(t_now, fr["frame"], filtered)
                     state["snap"] = {"t": t_now, "fused": fused, "dets": dets, "matched": matched,
-                                     "tracks": filtered, "rdets": out["dets"], "rkinds": out["kinds"]}
+                                     "tracks": filtered, "rdets": out["dets"], "rkinds": out["kinds"],
+                                     "radar_fps": radar_fps.fps}
         except BaseException as e:                               # a thread dying shouldn't be silent
             state["error"] = f"{type(e).__name__}: {e}"
             print("RADAR STOPPED:", state["error"], flush=True)
 
     threading.Thread(target=radar_thread, daemon=True).start()
     n = 0
+    fusion_fps = radar.FpsMeter()
     try:
         while True:
             ok, frame = cap.read()
@@ -609,6 +615,7 @@ def run_live(dump=None):
             dets = yolo_detections(yolo, frame, t, keep)
             fus.push_camera(t, dets, frame)
             n += 1
+            fusion_fps.tick()
             if n % 50 == 0:
                 yaw = fus.apply_calibration()
                 if yaw is not None:
@@ -616,11 +623,12 @@ def run_live(dump=None):
             s = state["snap"]
             stale = (t - s["t"]) > RADAR_STALE_S or state["error"] is not None
             if SHOW_WINDOW:
-                img = draw_overlay(frame, s["fused"], dets, s["matched"], cam, s["tracks"], radar_stale=stale)
+                img = draw_overlay(frame, s["fused"], dets, s["matched"], cam, s["tracks"], radar_stale=stale,
+                                   fps=fusion_fps.fps)
                 cv2.imshow("fusion", img)
                 cv2.imshow("radar", radar.render(s["rdets"], s["rkinds"], [] if stale else s["tracks"], pipe.bg,
                                                  meters=radar.DRAW_METERS, only_ids=interesting_ids(s["fused"]),
-                                                 title="RADAR STALE" if stale else ""))
+                                                 title="RADAR STALE" if stale else "", fps=s["radar_fps"]))
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     break
     finally:

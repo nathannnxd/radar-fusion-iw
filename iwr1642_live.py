@@ -567,7 +567,23 @@ def byte_source():
                 yield chunk
 
 
-def render(dets, kinds, tracks, bg, meters=DRAW_METERS, title="", only_ids=None):
+class FpsMeter:
+    """EMA of inter-call timing, ticked once per frame at each display's own natural rate."""
+    def __init__(self, alpha=0.2):
+        self.alpha, self.fps, self._last = alpha, 0.0, None
+
+    def tick(self, now=None):
+        now = time.time() if now is None else now
+        if self._last is not None:
+            dt = now - self._last
+            if dt > 0:
+                inst = 1.0 / dt
+                self.fps = inst if self.fps == 0 else self.fps + self.alpha * (inst - self.fps)
+        self._last = now
+        return self.fps
+
+
+def render(dets, kinds, tracks, bg, meters=DRAW_METERS, title="", only_ids=None, fps=None):
     """Top-down view frame (BGR 500×540): points by type, tracks with ID, trail, and speed arrow.
     Used by both the live window and video recording (RECORD_VIDEO)."""
     meters = max(1, int(round(meters)))
@@ -611,6 +627,8 @@ def render(dets, kinds, tracks, bg, meters=DRAW_METERS, title="", only_ids=None)
     status = "background: learning" if (bg is not None and bg.learning) else \
         (f"background: {bg.n_cells} cells" if bg is not None else "background: off")
     cv2.putText(img, status, (8, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 150, 150), 1)
+    if fps is not None:
+        cv2.putText(img, f"{fps:4.1f} fps", (W - 90, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 150, 150), 1)
     if title:
         cv2.putText(img, title, (8, H0 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 150, 150), 1)
     # legend
@@ -622,10 +640,10 @@ def render(dets, kinds, tracks, bg, meters=DRAW_METERS, title="", only_ids=None)
     return img
 
 
-def draw(dets, kinds, tracks, bg, meters=DRAW_METERS, title=""):
+def draw(dets, kinds, tracks, bg, meters=DRAW_METERS, title="", fps=None):
     if cv2 is None or not SHOW_WINDOW:
         return False
-    cv2.imshow("IWR1642 - points / tracks", render(dets, kinds, tracks, bg, meters, title))
+    cv2.imshow("IWR1642 - points / tracks", render(dets, kinds, tracks, bg, meters, title, fps=fps))
     return (cv2.waitKey(1) & 0xFF) == ord("q")
 
 
@@ -678,6 +696,7 @@ def main():
 
     pipe = Pipeline(cfg, model, EGO_SPEED_MPS)
     log = open(f"frames_{datetime.now():%Y%m%d_%H%M%S}.jsonl", "w", encoding="utf-8") if LOG_JSONL else None
+    fps_meter = FpsMeter()
     buffer, n, t0 = b"", 0, time.time()
     try:
         for chunk in byte_source():
@@ -693,6 +712,7 @@ def main():
                     continue
                 n += 1
                 out = pipe.process(frame)
+                fps_meter.tick()
                 if n % 5 == 0:
                     fps = n / max(time.time() - t0, 1e-6)
                     counts = pd.Series(out["kinds"]).value_counts().to_dict() if out["kinds"] else {}
@@ -710,7 +730,8 @@ def main():
                                        for d, k_, c in zip(out["dets"], out["kinds"], out["confs"])],
                         "radar_tracks": [tr.contract() for tr in out["tracks"]],
                     }, ensure_ascii=False, default=float) + "\n")
-                if draw(out["dets"], out["kinds"], out["tracks"], pipe.bg, title=f"frame {frame['frame']}  t={out['t']:.1f}s"):
+                if draw(out["dets"], out["kinds"], out["tracks"], pipe.bg,
+                        title=f"frame {frame['frame']}  t={out['t']:.1f}s", fps=fps_meter.fps):
                     raise KeyboardInterrupt
     except KeyboardInterrupt:
         print("\n⏹ Stopped.")
