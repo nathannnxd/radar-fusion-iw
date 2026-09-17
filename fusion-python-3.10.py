@@ -78,6 +78,7 @@ HOLD_MAX_S = 30.0                    # camera lost the object, radar is tracking
 HOLD_FOV_MARGIN_DEG = 8.0            # object is "in frame" if azimuth is within FOV with margin ≥ 2·AZ_SIGMA
 MERGE_DIST_M = 0.9                   # an unpaired radar track closer than this to an object...
 MERGE_DV_MPS = 0.8                   # ...with a similar speed (wraparound-aware) and the same azimuth — is part of it, not a separate object
+RADAR_DOT_SUPPRESS_MARGIN_PX = 40    # a "radar only" dot within this many px (horizontally) of a shown object's box is a duplicate, not a separate detection
 SHOW_ONLY_INTERESTING = True
 MOVING_MPS = 0.25
 RADAR_STALE_S = 0.5                  # radar hasn't updated for this long — consider it lost (banner, tracks not drawn)
@@ -491,6 +492,14 @@ def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, 
         _range_label(img, 8, 30, "RADAR LOST / STALE — camera only", (0, 60, 255), 0.7)
         fused = []
     fused_cam_ids = {f["cam_id"] for f in fused if f.get("state") == "both"}
+    # horizontal spans of every object box shown this frame: a "radar only" dot landing in one of
+    # these is (almost always) the same physical object, not a separate detection — the dot has no
+    # real vertical position of its own (radar has no elevation, v is just frame-center), so only
+    # the horizontal span is meaningful to compare against
+    object_x_spans = [(d.x1, d.x2) for d in cam_dets if d.cam_id not in fused_cam_ids]
+    for f in fused:
+        if f.get("absorbed_by") is None and f.get("state") in ("both", "hold") and f.get("bbox"):
+            object_x_spans.append((f["bbox"][0], f["bbox"][2]))
     nearest = None
     for d in cam_dets:
         if d.cam_id in fused_cam_ids:
@@ -538,6 +547,8 @@ def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, 
             continue
         u = int(cam.u_of_cam_azimuth(f["az_from_cam"])); v = int(cam.h / 2)
         if 0 <= u < cam.w:
+            if any(x1 - RADAR_DOT_SUPPRESS_MARGIN_PX <= u <= x2 + RADAR_DOT_SUPPRESS_MARGIN_PX for x1, x2 in object_x_spans):
+                continue   # same horizontal area as an object already shown — same physical thing, not a new detection
             cv2.circle(img, (u, v), 9, (0, 0, 255), 2)
             _range_label(img, u + 12, v + 6, f"{r:.1f} m", (0, 0, 255), 0.6)
             cv2.putText(img, f"radar only {vr:+.1f} m/s", (u + 12, v + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
