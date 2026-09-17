@@ -37,6 +37,10 @@ try:
     from ultralytics import YOLO
 except ImportError:
     YOLO = None
+try:
+    import torch
+except ImportError:
+    torch = None
 
 with open("configs.json", "r") as file:
     code_config = json.load(file)            # Read/edit configs.json
@@ -44,6 +48,7 @@ with open("configs.json", "r") as file:
 CAMERA_INDEX = code_config["CAMERA_INDEX"]   # 0 — built-in camera; 1 — external USB
 DETECTOR = code_config["DETECTOR"]           # "yolov8n" — COCO, fast; "yolo-world" — open vocabulary (WORLD_CLASSES),
                                              # first run downloads weights + CLIP (~340 MB), ~0.25 s/frame on CPU
+USE_GPU = code_config.get("USE_GPU", 1)      # 1 — run YOLO on the GPU (CUDA) if one is available; 0 — force CPU
 YOLO_WEIGHTS = {"yolov8n": "yolov8n.pt", "yolo-world": "yolov8s-worldv2.pt"}
 YOLO_CONF = 0.4
 #YOLO_KEEP = {0: ("person", 1.70), 1: ("bicycle", 1.10), 2: ("car", 1.50), 3: ("motorcycle", 1.20),
@@ -85,6 +90,12 @@ SHOW_FPS = code_config["SHOW_FPS"]   # 1 — draw the fps counter on the radar/f
 Q_SHARP_DROP = 0.45        # sharpness below 45 % of the reference
 Q_CONTRAST_DROP = 0.45     # contrast below 45 % of the reference
 
+YOLO_DEVICE = "cpu"
+if USE_GPU:
+    if torch is not None and torch.cuda.is_available():
+        YOLO_DEVICE = "cuda:0"
+    else:
+        print("⚠️ USE_GPU=1 but no CUDA GPU available (torch missing or no CUDA build) — running YOLO on CPU")
 
 # ---------------------------------------------------------------- camera geometry
 class CameraModel:
@@ -428,6 +439,8 @@ class Fusion:
 # ---------------------------------------------------------------- camera
 def load_detector(kind=DETECTOR):
     model = YOLO(YOLO_WEIGHTS[kind])
+    model.to(YOLO_DEVICE)
+    print(f"YOLO running on: {YOLO_DEVICE}")
     if kind == "yolo-world":
         names = list(WORLD_CLASSES)
         model.set_classes(names)
@@ -436,7 +449,7 @@ def load_detector(kind=DETECTOR):
 
 
 def yolo_detections(model, frame, t, keep=YOLO_KEEP):
-    res = model.track(frame, conf=YOLO_CONF, persist=True, verbose=False, tracker="bytetrack.yaml")[0]
+    res = model.track(frame, conf=YOLO_CONF, persist=True, verbose=False, tracker="bytetrack.yaml", device=YOLO_DEVICE)[0]
     dets = []
     if res.boxes is None:
         return dets
