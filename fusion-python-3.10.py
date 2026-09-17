@@ -71,6 +71,7 @@ RADAR_STALE_S = 0.5        # radar hasn't updated for this long — consider it 
 CSV_FOLDER = "logs"
 CSV_PATH = os.path.join(CSV_FOLDER, f"fusion_{datetime.now():%Y%m%d_%H%M%S}.csv")
 SHOW_WINDOW = True
+SHOW_FPS = 1               # 1 — draw the fps counter on the radar/fusion displays; 0 — off
 
 Q_SHARP_DROP = 0.45        # sharpness below 45 % of the reference
 Q_CONTRAST_DROP = 0.45     # contrast below 45 % of the reference
@@ -624,11 +625,12 @@ def run_live(dump=None):
             stale = (t - s["t"]) > RADAR_STALE_S or state["error"] is not None
             if SHOW_WINDOW:
                 img = draw_overlay(frame, s["fused"], dets, s["matched"], cam, s["tracks"], radar_stale=stale,
-                                   fps=fusion_fps.fps)
+                                   fps=fusion_fps.fps if SHOW_FPS else None)
                 cv2.imshow("fusion", img)
                 cv2.imshow("radar", radar.render(s["rdets"], s["rkinds"], [] if stale else s["tracks"], pipe.bg,
                                                  meters=radar.DRAW_METERS, only_ids=interesting_ids(s["fused"]),
-                                                 title="RADAR STALE" if stale else "", fps=s["radar_fps"]))
+                                                 title="RADAR STALE" if stale else "",
+                                                 fps=s["radar_fps"] if SHOW_FPS else None))
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     break
     finally:

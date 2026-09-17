@@ -45,6 +45,7 @@ DUMP_FILE = None           # "radar_dump.bin" — replay a recording without por
 SEND_CFG = True            # False if the radar is already streaming (e.g. started from Visualizer)
 EGO_SPEED_MPS = 0.0        # carrier speed, m/s; 0 on the bench, from odometry on the tractor
 SHOW_WINDOW = True         # OpenCV window
+SHOW_FPS = 1               # 1 — draw the fps counter on the display; 0 — off
 DRAW_METERS = 15           # image radius, m: 10 for a room, 30–50 for a field
 LOG_JSONL = True           # write frames and tracks to frames_<time>.jsonl
 
@@ -731,7 +732,7 @@ def main():
                         "radar_tracks": [tr.contract() for tr in out["tracks"]],
                     }, ensure_ascii=False, default=float) + "\n")
                 if draw(out["dets"], out["kinds"], out["tracks"], pipe.bg,
-                        title=f"frame {frame['frame']}  t={out['t']:.1f}s", fps=fps_meter.fps):
+                        title=f"frame {frame['frame']}  t={out['t']:.1f}s", fps=fps_meter.fps if SHOW_FPS else None):
                     raise KeyboardInterrupt
     except KeyboardInterrupt:
         print("\n⏹ Stopped.")
