@@ -93,6 +93,10 @@ Pi**, they will not be right by default:
   ```
   Set `CAMERA_INDEX` to whichever `/dev/videoN` your USB camera landed on (usually `0` if it's the only
   camera; the Pi's own camera connector, if enabled, can also claim index 0 — check both).
+- **A third serial port, if you're using the alert system (see §9):** `ALERT_SERIAL_PORT` in
+  `configs.json` is a *separate* port from `CLI_PORT`/`DATA_PORT` above — it's the connection to
+  whatever MCU is receiving alerts, not the radar. On a Pi with only one built-in USB-serial-capable
+  header, this typically means a second USB-serial adapter; same `dialout` group requirement applies.
 
 ## 5. What changed on this branch vs. the main pipeline
 
@@ -116,6 +120,8 @@ Pi**, they will not be right by default:
   hardcoded Windows path left over from development and imported a module (`fusion`) that doesn't exist
   under that name (the actual file is `fusion-python-3.10.py`, which isn't a valid Python module name).
   This meant `fusion_offline.py` couldn't run on *any* platform before this fix, not just the Pi.
+- **`alerts.py`** — ported over from the main branch, unmodified (no Pi-specific concerns — it's pure
+  `pyserial`). See §9.
 
 ## 6. Expected performance
 
@@ -149,7 +155,15 @@ more than older/cheaper "phone charger" USB power supplies provide — on either
 If you see random USB disconnects (the radar or camera dropping out), check the power supply first —
 that's not a code bug.
 
-## 8. Still to do / verify on real hardware
+## 9. Alert system (MCU output)
+
+This branch includes `alerts.py` — see `ALERTS.md` for the full wire format, alert code table, and
+a generic C reference parser. Nothing about it is Pi-specific (it's pure `pyserial`, already a
+dependency here), so it works identically to the desktop version; the only Pi-specific note is the
+serial port one in §4 above. Leave `ALERT_SERIAL_PORT` empty in `configs.json` to test it
+console-only before wiring up any actual MCU.
+
+## 10. Still to do / verify on real hardware
 
 Applies to whichever board you're actually deploying on (Pi 4 or Pi 5):
 
