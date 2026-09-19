@@ -5,5 +5,13 @@
     "SHOW_FPS": 1,
     "USE_GPU": 1,
     "CAMERA_INDEX": 1,
-    "RADAR_CONFIG": "radar_configs/config-16.09.26-12.43.cfg"
+    "RADAR_CONFIG": "radar_configs/config-16.09.26-12.43.cfg",
+    "ALERTS_ENABLED": 1,
+    "ALERT_SERIAL_PORT": "",
+    "ALERT_BAUD": 115200,
+    "PROXIMITY_WARN_M": 3.0,
+    "PROXIMITY_CRITICAL_M": 1.5,
+    "CLOSING_SPEED_ALERT_MPS": 2.0,
+    "RADAR_ONLY_CONFIRM_S": 1.0,
+    "ALERT_RESEND_S": 2.0
 }
