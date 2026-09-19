@@ -1,9 +1,11 @@
 {
-    "CLI_PORT": "COM6",
-    "DATA_PORT": "COM7",
-    "DETECTOR": "yolo-world",
+    "CLI_PORT": "/dev/ttyACM0",
+    "DATA_PORT": "/dev/ttyACM1",
+    "DETECTOR": "yolov8n",
     "SHOW_FPS": 1,
-    "USE_GPU": 1,
-    "CAMERA_INDEX": 1,
+    "USE_GPU": 0,
+    "USE_NCNN": 1,
+    "YOLO_IMGSZ": [320, 416],
+    "CAMERA_INDEX": 0,
     "RADAR_CONFIG": "radar_configs/config-16.09.26-12.43.cfg"
 }

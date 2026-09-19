@@ -1,0 +1,24 @@
+# Raspberry Pi 4 dependencies for this project (radar pipeline + fusion + YOLOv8n/NCNN).
+# See RASPBERRY_PI.md for the full setup walkthrough — OS/Python requirements, serial port
+# and camera discovery, and why each of these is here.
+#
+# Install with:  pip install -r requirements-rpi.txt
+#
+# Checked against PyPI on 2026-09-19: every package below ships a prebuilt aarch64 Linux wheel
+# for Python 3.10/3.11 (manylinux_2_28 or looser) — none of these need to compile from source
+# on a 64-bit Raspberry Pi OS (Bookworm) with Python 3.10+. See RASPBERRY_PI.md for the Python
+# 3.9 / Bullseye fallback (older pinned torch).
+
+numpy
+pandas
+scikit-learn        # DBSCAN clustering (iwr1642_live.cluster_objects)
+pyserial             # radar UART (CLI_PORT / DATA_PORT)
+joblib               # loads radar_lightgbm_model.pkl
+lightgbm             # NOT imported directly anywhere in the code, but required to unpickle
+                     # radar_lightgbm_model.pkl (joblib.load needs the class definitions available)
+opencv-python        # needs libgtk/libqt on the Pi for cv2.imshow — see RASPBERRY_PI.md;
+                     # swap for opencv-python-headless if running with SHOW_WINDOW = False
+ultralytics          # YOLOv8n detector + ByteTrack; pure-Python package, no arch-specific wheel needed
+torch                # CPU-only on the Pi (no CUDA) — only used as a dependency of ultralytics and
+torchvision          # for the (always-false-on-Pi) torch.cuda.is_available() check
+ncnn                 # needed for USE_NCNN=1 (ultralytics' NCNN export/inference backend)

@@ -49,6 +49,13 @@ CAMERA_INDEX = code_config["CAMERA_INDEX"]   # 0 — built-in camera; 1 — exte
 DETECTOR = code_config["DETECTOR"]           # "yolov8n" — COCO, fast; "yolo-world" — open vocabulary (WORLD_CLASSES),
                                              # first run downloads weights + CLIP (~340 MB), ~0.25 s/frame on CPU
 USE_GPU = code_config.get("USE_GPU", 1)      # 1 — run YOLO on the GPU (CUDA) if one is available; 0 — force CPU
+USE_NCNN = code_config.get("USE_NCNN", 0)    # 1 — export/run YOLO via the NCNN backend instead of plain PyTorch;
+                                             # much faster on ARM/Raspberry Pi CPUs (no CUDA there anyway). CPU-only:
+                                             # ignores USE_GPU/YOLO_DEVICE. First run exports and caches a
+                                             # <weights>_ncnn_model/ folder next to the .pt weights (needs internet
+                                             # once, to fetch the pnnx converter); later runs load the cached export.
+YOLO_IMGSZ = code_config.get("YOLO_IMGSZ", 640)   # inference resolution passed to model.track(); an int (square) or
+                                                  # [h, w] (each must be a multiple of 32) — e.g. [320, 416] on a Pi
 YOLO_WEIGHTS = {"yolov8n": "yolov8n.pt", "yolo-world": "yolov8s-worldv2.pt"}
 YOLO_CONF = 0.4
 #YOLO_KEEP = {0: ("person", 1.70), 1: ("bicycle", 1.10), 2: ("car", 1.50), 3: ("motorcycle", 1.20),
@@ -438,18 +445,33 @@ class Fusion:
 
 # ---------------------------------------------------------------- camera
 def load_detector(kind=DETECTOR):
-    model = YOLO(YOLO_WEIGHTS[kind])
-    model.to(YOLO_DEVICE)
-    print(f"YOLO running on: {YOLO_DEVICE}")
+    weights = YOLO_WEIGHTS[kind]
+    model = YOLO(weights)
+    keep = YOLO_KEEP
     if kind == "yolo-world":
         names = list(WORLD_CLASSES)
-        model.set_classes(names)
-        return model, {i: (n, WORLD_CLASSES[n]) for i, n in enumerate(names)}
-    return model, YOLO_KEEP
+        model.set_classes(names)          # must happen before an NCNN export below bakes in the class set
+        keep = {i: (n, WORLD_CLASSES[n]) for i, n in enumerate(names)}
+    if USE_NCNN:
+        # NCNN export is validated here against yolov8n (the Pi-recommended detector); yolo-world's open-vocab
+        # CLIP head may not export cleanly to NCNN via ultralytics — untested combination, use at your own risk
+        ncnn_dir = os.path.splitext(weights)[0] + "_ncnn_model"
+        if not os.path.isdir(ncnn_dir):
+            print(f"Exporting {weights} to NCNN at imgsz={YOLO_IMGSZ} (needs internet the first time, to fetch the pnnx converter) ...")
+            model.export(format="ncnn", imgsz=YOLO_IMGSZ)
+        model = YOLO(ncnn_dir)
+        print(f"YOLO running on: NCNN ({ncnn_dir}), imgsz={YOLO_IMGSZ}")
+    else:
+        model.to(YOLO_DEVICE)
+        print(f"YOLO running on: {YOLO_DEVICE}")
+    return model, keep
 
 
 def yolo_detections(model, frame, t, keep=YOLO_KEEP):
-    res = model.track(frame, conf=YOLO_CONF, persist=True, verbose=False, tracker="bytetrack.yaml", device=YOLO_DEVICE)[0]
+    kwargs = dict(conf=YOLO_CONF, persist=True, verbose=False, tracker="bytetrack.yaml", imgsz=YOLO_IMGSZ)
+    if not USE_NCNN:
+        kwargs["device"] = YOLO_DEVICE    # the NCNN backend is CPU-only and doesn't take a device= override
+    res = model.track(frame, **kwargs)[0]
     dets = []
     if res.boxes is None:
         return dets

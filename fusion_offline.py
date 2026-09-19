@@ -12,6 +12,7 @@ Camera time — camera_times.csv; radar time — radar_times.csv (the byte chunk
 """
 import argparse
 import csv
+import importlib.util
 import json
 import os
 import sys
@@ -20,10 +21,18 @@ from collections import defaultdict
 import cv2
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath('E:\Kuliah\Skoltech - Engineering Systems\Innovation Workshops\fusion\radar_pack')))
+# portable — works regardless of the directory this script is launched from (Windows/Linux/macOS/Pi alike),
+# unlike the previous hardcoded Windows path this replaced
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _here)
 import iwr1642_live as radar
-import fusion as F
 import radar_filter
+
+# fusion-python-3.10.py isn't a valid module name (hyphen + dot), so it can't be `import`ed directly —
+# load it by file path instead. This also means `import fusion as F` here was never a working import.
+_fusion_spec = importlib.util.spec_from_file_location("fusion_live", os.path.join(_here, "fusion-python-3.10.py"))
+F = importlib.util.module_from_spec(_fusion_spec)
+_fusion_spec.loader.exec_module(F)
 
 
 def radar_frames_with_time(rec):
