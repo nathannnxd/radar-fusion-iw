@@ -28,6 +28,7 @@ import numpy as np
 
 import iwr1642_live as radar
 import radar_filter
+import alerts
 
 try:
     import cv2
@@ -93,6 +94,15 @@ CSV_FOLDER = "logs"
 CSV_PATH = os.path.join(CSV_FOLDER, f"fusion_{datetime.now():%Y%m%d_%H%M%S}.csv")
 SHOW_WINDOW = True
 SHOW_FPS = code_config["SHOW_FPS"]   # 1 — draw the fps counter on the radar/fusion displays; 0 — off
+
+ALERTS_ENABLED = code_config.get("ALERTS_ENABLED", 1)          # 1 — evaluate and send alerts.py events; 0 — off
+ALERT_SERIAL_PORT = code_config.get("ALERT_SERIAL_PORT", "")   # e.g. "COM8" / "/dev/ttyUSB1" — the MCU's port; "" — console only, no serial sink
+ALERT_BAUD = code_config.get("ALERT_BAUD", 115200)
+PROXIMITY_WARN_M = code_config.get("PROXIMITY_WARN_M", 3.0)          # object closer than this — PROXIMITY_WARNING
+PROXIMITY_CRITICAL_M = code_config.get("PROXIMITY_CRITICAL_M", 1.5)  # ...and this — PROXIMITY_CRITICAL
+CLOSING_SPEED_ALERT_MPS = code_config.get("CLOSING_SPEED_ALERT_MPS", 2.0)  # FAST_APPROACH threshold
+RADAR_ONLY_CONFIRM_S = code_config.get("RADAR_ONLY_CONFIRM_S", 1.0)  # radar-only object must persist this long before alerting (avoids alerting on a single-frame clutter blip)
+ALERT_RESEND_S = code_config.get("ALERT_RESEND_S", 2.0)              # heartbeat interval for an alert that's still active
 
 Q_SHARP_DROP = 0.45        # sharpness below 45 % of the reference
 Q_CONTRAST_DROP = 0.45     # contrast below 45 % of the reference
@@ -615,6 +625,15 @@ def run_live(dump=None):
     cam = CameraModel(w, h)
     fus = Fusion(cam)
     yolo, keep = load_detector()
+
+    alert_engine = None
+    if ALERTS_ENABLED:
+        sinks = [alerts.ConsoleAlertSink()]
+        if ALERT_SERIAL_PORT:
+            sinks.append(alerts.SerialAlertSink(ALERT_SERIAL_PORT, ALERT_BAUD))
+        alert_engine = alerts.AlertEngine(sinks, resend_s=ALERT_RESEND_S, radar_only_confirm_s=RADAR_ONLY_CONFIRM_S,
+                                          proximity_warn_m=PROXIMITY_WARN_M, proximity_critical_m=PROXIMITY_CRITICAL_M,
+                                          closing_speed_mps=CLOSING_SPEED_ALERT_MPS)
     t_start = time.time()
     clock = lambda: time.time() - t_start
     snap = {"t": -1e9, "fused": [], "dets": [], "matched": {}, "tracks": [], "rdets": [], "rkinds": [], "radar_fps": 0.0}
@@ -677,6 +696,8 @@ def run_live(dump=None):
                     print(f"calibration: yaw radar↔camera = {yaw:+.1f}° ({len(fus.calib.pairs)} pairs)")
             s = state["snap"]
             stale = (t - s["t"]) > RADAR_STALE_S or state["error"] is not None
+            if alert_engine is not None:
+                alert_engine.evaluate(t, s["fused"], dets, cam, stale)
             if SHOW_WINDOW:
                 img = draw_overlay(frame, s["fused"], dets, s["matched"], cam, s["tracks"], radar_stale=stale,
                                    fps=fusion_fps.fps if SHOW_FPS else None)
@@ -689,6 +710,8 @@ def run_live(dump=None):
                     break
     finally:
         stop.set(); cap.release(); fus.close()
+        if alert_engine is not None:
+            alert_engine.close()
         try:
             cv2.destroyAllWindows()
         except cv2.error:
