@@ -1,4 +1,5 @@
-# Raspberry Pi 4 dependencies for this project (radar pipeline + fusion + YOLOv8n/NCNN).
+# Raspberry Pi 4/5 dependencies for this project (radar pipeline + fusion + YOLOv8n/NCNN).
+# Same aarch64 wheels apply to both boards.
 # See RASPBERRY_PI.md for the full setup walkthrough — OS/Python requirements, serial port
 # and camera discovery, and why each of these is here.
 #
