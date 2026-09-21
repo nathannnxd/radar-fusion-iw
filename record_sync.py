@@ -26,11 +26,13 @@ except ImportError:
     serial = None
 
 # ---------------------------------------------------------------- SETTINGS
-CAMERA_INDEX = 1            # 0 — built-in camera; 1 — external USB
+import json as _json
+_cfg = _json.load(open("configs.json"))
+CAMERA_INDEX = _cfg["CAMERA_INDEX"]
 CAM_WIDTH, CAM_HEIGHT = 640, 480
-CLI_PORT = "COM5"           # command port (User UART)
-DATA_PORT = "COM6"          # data port (Auxiliary)
-CFG_FILE = "profile_sdk3.cfg"
+CLI_PORT = _cfg["CLI_PORT"]
+DATA_PORT = _cfg["DATA_PORT"]
+CFG_FILE = _cfg["RADAR_CONFIG"]
 SEND_CFG = True             # False if the radar is already streaming
 RADAR_TO_CAMERA_CM = {"right": 0.0, "up": 0.0, "forward": 0.0}   # where the radar is relative to the camera lens
 MAX_SECONDS = 600           # safety net: stop after 10 minutes
@@ -41,13 +43,17 @@ MAGIC = b"\x02\x01\x04\x03\x06\x05\x08\x07"
 
 
 def send_config():
-    with serial.Serial(CLI_PORT, 115200, timeout=1) as ser, open(CFG_FILE, encoding="utf-8") as f:
+    # NOTE: keep the returned CLI port OPEN while reading the data port. On Linux the XDS110 resets the
+    # data port to 115200 the moment the CLI port is closed (Windows doesn't care) -> garbage instead of frames.
+    ser = serial.Serial(CLI_PORT, 115200, timeout=1)
+    with open(CFG_FILE, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("%"):
                 ser.write((line + "\n").encode())
                 time.sleep(0.05)
     print("✓ config sent to", CLI_PORT)
+    return ser
 
 
 def radar_writer(stop, clock, out_dir, stats):
@@ -87,11 +93,11 @@ def main():
 
     if serial is None:
         raise SystemExit("pip install pyserial")
-    if SEND_CFG:
-        try:
-            send_config()
-        except Exception as e:
-            print(f"⚠️ config not sent ({e}) — fine if the radar is already streaming")
+    cli_ser = None                                    # held open until the end of main (see send_config)
+    try:
+        cli_ser = send_config() if SEND_CFG else serial.Serial(CLI_PORT, 115200, timeout=1)
+    except Exception as e:
+        print(f"⚠️ config not sent ({e}) — fine if the radar is already streaming")
 
     t_start = time.perf_counter()
     clock = lambda: time.perf_counter() - t_start
@@ -138,6 +144,8 @@ def main():
     finally:
         stop.set(); th.join(timeout=2)
         writer.release(); ft.close(); cap.release()
+        if cli_ser is not None:
+            cli_ser.close()
         try:
             cv2.destroyAllWindows()
         except cv2.error:

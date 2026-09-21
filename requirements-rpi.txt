@@ -21,5 +21,10 @@ opencv-python        # needs libgtk/libqt on the Pi for cv2.imshow — see RASPB
                      # swap for opencv-python-headless if running with SHOW_WINDOW = False
 ultralytics          # YOLOv8n detector + ByteTrack; pure-Python package, no arch-specific wheel needed
 torch                # CPU-only on the Pi (no CUDA) — only used as a dependency of ultralytics and
-torchvision          # for the (always-false-on-Pi) torch.cuda.is_available() check
+torchvision          # for the (always-false-on-Pi) torch.cuda.is_available() check.
+                     # NB: the PyPI aarch64 wheel is the CUDA build and needs cuda-toolkit (uninstallable on a Pi);
+                     # install these two from the CPU index first:
+                     #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+lap>=0.5.12          # linear assignment for ByteTrack (model.track()); ultralytics auto-installs it otherwise,
+                     # which fails without internet
 ncnn                 # needed for USE_NCNN=1 (ultralytics' NCNN export/inference backend)

@@ -30,16 +30,24 @@ def list_ports():
         print(f"  {p.device:8s} {p.description}")
     cli = data = None
     for p in ports:
-        d = p.description.lower()
+        d = (p.description or "").lower(); hw = (p.hwid or "").lower()
         if "xds110" in d and ("application" in d or "user" in d):
             cli = p.device
         elif "xds110" in d and ("auxiliary" in d or "data" in d):
             data = p.device
+        elif "0451:bef3" in hw:                       # Linux: both ports look alike; interface 0 = CLI, 3 = data
+            if p.location and p.location.endswith(":1.0") or (p.device_path or "").endswith(":1.0"):
+                cli = p.device
+            elif p.location and p.location.endswith(":1.3") or (p.device_path or "").endswith(":1.3"):
+                data = p.device
     return cli, data
 
 
 def send_config(cli_port, cfg_path):
-    with serial.Serial(cli_port, 115200, timeout=1) as ser, open(cfg_path, encoding="utf-8") as f:
+    # NOTE: keep the returned CLI port OPEN while reading the data port. On Linux the XDS110 resets the
+    # data port to 115200 the moment the CLI port is closed (Windows doesn't care) -> garbage instead of frames.
+    ser = serial.Serial(cli_port, 115200, timeout=1)
+    with open(cfg_path, encoding="utf-8") as f:
         print(f"Sending {cfg_path} to {cli_port} ...")
         for line in f:
             line = line.strip()
@@ -51,6 +59,7 @@ def send_config(cli_port, cfg_path):
             if reply:
                 print(f"  > {line}\n    < {reply.splitlines()[-1]}")
     print("Config sent.")
+    return ser
 
 
 def dump(data_port, seconds, out_path):
@@ -87,14 +96,21 @@ def main():
         sys.exit("Data port not found. Specify --data COMx (see list above).")
     print(f"CLI: {cli or '-'}   DATA: {data}")
 
+    cli_ser = None
     if args.cfg:
         if not cli:
             sys.exit("--cfg requires a command port: --cli COMx")
-        send_config(cli, args.cfg)
+        cli_ser = send_config(cli, args.cfg)
         time.sleep(0.5)
+    elif cli:
+        cli_ser = serial.Serial(cli, 115200, timeout=1)      # even without --cfg: hold the CLI port open (see send_config)
 
     out = f"radar_dump_{datetime.now():%Y%m%d_%H%M%S}.bin"
-    dump(data, args.sec, out)
+    try:
+        dump(data, args.sec, out)
+    finally:
+        if cli_ser is not None:
+            cli_ser.close()
     print(f"\nDone. Send the file {out} (and .cfg, if you sent one).")
 
 

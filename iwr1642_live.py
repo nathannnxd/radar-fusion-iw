@@ -538,13 +538,17 @@ class Tracker:
 
 # ---------------------------------------------------------------- input-output
 def send_config(cli_port, cfg_path):
-    with serial.Serial(cli_port, 115200, timeout=1) as ser, open(cfg_path, encoding="utf-8") as f:
+    # NOTE: keep the returned CLI port OPEN while reading the data port. On Linux the XDS110 resets the
+    # data port to 115200 the moment the CLI port is closed (Windows doesn't care) -> garbage instead of frames.
+    ser = serial.Serial(cli_port, 115200, timeout=1)
+    with open(cfg_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("%"):
                 ser.write((line + "\n").encode())
                 time.sleep(0.05)
     print("✓ Config sent to", cli_port)
+    return ser
 
 
 def byte_source():
@@ -557,17 +561,24 @@ def byte_source():
         return
     if serial is None:
         raise SystemExit("pip install pyserial")
-    if SEND_CFG:
-        try:
-            send_config(CLI_PORT, CFG_FILE)
-        except Exception as e:
-            print(f"⚠️ Config not sent ({e}). Fine if the radar is already streaming.")
-    with serial.Serial(DATA_PORT, 921600, timeout=0.01) as ser:
-        print("=== Listening on", DATA_PORT, "· Ctrl+C or q to exit ===")
-        while True:
-            chunk = ser.read(max(1, ser.in_waiting))     # yield whatever arrived, don't wait for 4096 bytes: better timing
-            if chunk:
-                yield chunk
+    cli_ser = None
+    try:
+        if SEND_CFG:
+            cli_ser = send_config(CLI_PORT, CFG_FILE)
+        else:
+            cli_ser = serial.Serial(CLI_PORT, 115200, timeout=1)   # hold the CLI port open anyway (see send_config)
+    except Exception as e:
+        print(f"⚠️ Config not sent ({e}). Fine if the radar is already streaming.")
+    try:
+        with serial.Serial(DATA_PORT, 921600, timeout=0.01) as ser:
+            print("=== Listening on", DATA_PORT, "· Ctrl+C or q to exit ===")
+            while True:
+                chunk = ser.read(max(1, ser.in_waiting))     # yield whatever arrived, don't wait for 4096 bytes: better timing
+                if chunk:
+                    yield chunk
+    finally:
+        if cli_ser is not None:
+            cli_ser.close()
 
 
 class FpsMeter:

@@ -173,3 +173,32 @@ Applies to whichever board you're actually deploying on (Pi 4 or Pi 5):
 - [ ] Measure real FPS and compare against the estimate for your board above (~12–15 FPS on a Pi 4, ~25–40 FPS on a Pi 5)
 - [ ] Check CPU temperature / throttling under sustained load (`vcgencmd measure_temp`); consider a fan/heatsink if throttling
 - [ ] If `yolo-world` is needed after all, test whether its NCNN export actually works before relying on it
+
+## Field notes — first run on real hardware (2026-09-21)
+
+Board: Raspberry Pi 4 Model B rev 1.5, 8 GB; Raspberry Pi OS Bookworm 64-bit (image 2026-09-15), Python 3.11.2.
+Validated end to end: IWR1642BOOST with `radar_configs/config-16.09.26-12.43.cfg` (15 fps) + USB webcam + YOLOv8n
+via NCNN (320×416) + fusion + `$RDALT` alerts on the console. What was **not** in the plan above and cost time:
+
+1. **torch must come from the CPU index.** `pip install torch` (or `pip download` for aarch64) resolves to the
+   CUDA build on PyPI, which now depends on `cuda-toolkit==13.x` and cannot be installed on a Pi. Use
+   `pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu` (torch 2.14.0+cpu, 152 MB
+   instead of 433 MB). Then `pip install -r requirements-rpi.txt`.
+2. **`lap` was missing from `requirements-rpi.txt`** — ByteTrack needs it and ultralytics tries to auto-install it on
+   the first `model.track()` call, which fails offline. Added.
+3. **ModemManager grabs the radar's serial ports.** The desktop image ships ModemManager, which probes every new
+   `ttyACM*` device. Disable it once: `sudo systemctl disable --now ModemManager`.
+4. **The data port only works while the CLI port is open (Linux only).** With XDS110 firmware 02.03.00.02 the
+   auxiliary data port drops back to 115200 baud the moment the command port is closed: the dump shows ~1/8 of the
+   expected bytes and no frame magic words. `dump_radar.py`, `record_sync.py` and `iwr1642_live.byte_source()` now
+   keep the CLI port open for the whole session. Windows never showed this.
+5. **Camera on Linux:** `cv2.CAP_DSHOW` exists as a constant on every platform, so `hasattr(cv2, "CAP_DSHOW")` was
+   selecting DirectShow on the Pi and the camera never opened. Fixed: V4L2 on Linux, plus an explicit `isOpened()`
+   check with a hint.
+6. **Throughput on the Pi 4:** ~5 fps camera loop at imgsz 320×416 with the desktop and a VNC session running
+   (heatsink fitted, `vcgencmd get_throttled` = 0x0); radar stays at 15 fps in its own thread. Smaller NCNN exports
+   and running YOLO on every 2nd frame are the next step.
+7. **Headless use:** `SHOW_WINDOW = False` for SSH-only runs. For a picture enable VNC
+   (`sudo raspi-config nonint do_vnc 0 && sudo raspi-config nonint do_vnc_resolution 1280x720`) and use TigerVNC
+   Viewer. If the Pi keyboard layout is not `us`, the `q` key never reaches the OpenCV window —
+   `sudo raspi-config nonint do_configure_keyboard us`.
