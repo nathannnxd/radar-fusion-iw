@@ -620,7 +620,10 @@ def run_live(dump=None):
     except Exception:
         pass
     pipe = radar.Pipeline(cfg, model_r, radar.EGO_SPEED_MPS)
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW if hasattr(cv2, "CAP_DSHOW") else 0)
+    # DirectShow exists only on Windows; on Linux/Pi use V4L2 (CAP_DSHOW constant exists everywhere, so hasattr() is not a valid test)
+    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_V4L2)
+    if not cap.isOpened():
+        raise SystemExit(f"camera {CAMERA_INDEX} did not open — check CAMERA_INDEX in configs.json (ls /dev/video*)")
     w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cam = CameraModel(w, h)
     fus = Fusion(cam)
