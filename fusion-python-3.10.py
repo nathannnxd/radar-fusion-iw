@@ -29,6 +29,7 @@ import numpy as np
 import iwr1642_live as radar
 import radar_filter
 import alerts
+import ego_velocity
 
 try:
     import cv2
@@ -103,6 +104,9 @@ PROXIMITY_CRITICAL_M = code_config.get("PROXIMITY_CRITICAL_M", 1.5)  # ...and th
 CLOSING_SPEED_ALERT_MPS = code_config.get("CLOSING_SPEED_ALERT_MPS", 2.0)  # FAST_APPROACH threshold
 RADAR_ONLY_CONFIRM_S = code_config.get("RADAR_ONLY_CONFIRM_S", 1.0)  # radar-only object must persist this long before alerting (avoids alerting on a single-frame clutter blip)
 ALERT_RESEND_S = code_config.get("ALERT_RESEND_S", 2.0)              # heartbeat interval for an alert that's still active
+
+EGO_SERIAL_PORT = code_config.get("EGO_SERIAL_PORT", "")   # e.g. "/dev/ttyUSB2" — the ESP32+IMU's port; "" — disabled, EGO_SPEED_MPS stays 0.0 (see ego_velocity.py / EGO_VELOCITY.md)
+EGO_BAUD = code_config.get("EGO_BAUD", 115200)
 
 Q_SHARP_DROP = 0.45        # sharpness below 45 % of the reference
 Q_CONTRAST_DROP = 0.45     # contrast below 45 % of the reference
@@ -311,7 +315,7 @@ class Fusion:
         # the box doesn't extend past the frame: what's beyond the edge the camera wouldn't show anyway
         return (int(max(0, cu - bw / 2)), int(max(0, ny1)), int(min(self.cam.w - 1, cu + bw / 2)), int(min(self.cam.h - 1, ny2)))
 
-    def on_radar(self, t, radar_frame, tracks):
+    def on_radar(self, t, radar_frame, tracks, ego_speed_mps=0.0):
         cam_dets, dt, gray = self._nearest_camera(t)
         cam_dets = cam_dets or []
         cam_view = [self.cam.cam_view(float(tr.x[0]), float(tr.x[1])) for tr in tracks]   # (az_from_cam, depth)
@@ -398,6 +402,10 @@ class Fusion:
                 "radar_id": tr.id, "range_m": tr.range_m, "range_near_m": tr.range_near_m,
                 "azimuth_deg": tr.azimuth_deg, "az_from_cam": az_from_cam, "depth_m": depth,
                 "radial_mps": tr.radial_mps, "speed_mps": tr.speed_mps, "coasting": tr.coasting, "sigma_m": tr.sigma_xy_m,
+                # platform-relative (above) is what matters for closing-speed/collision judgments — left
+                # untouched. ground_speed_mps is the separate, ego-motion-compensated view: ~0 for a
+                # truly stationary object even while the platform itself is moving. See EGO_VELOCITY.md.
+                "ground_speed_mps": tr.ground_speed_mps(ego_speed_mps),
                 "cam_id": (d.cam_id if d is not None else m.cam_id) if confirmed else None,
                 "fused_class": m.cls if confirmed else ("radar-only" if d is None else "pairing"),
                 "hits": m.hits if m else 0, "matched_now": d is not None,
@@ -513,13 +521,16 @@ def _dashed_rect(img, p1, p2, color, thick=2, dash=12):
                      (int(ax + (bx - ax) * s1), int(ay + (by - ay) * s1)), color, thick)
 
 
-def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, radar_stale=False, fps=None):
+def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, radar_stale=False, fps=None,
+                 ego_speed_mps=None):
     """Green box — both sensors; cyan — camera lost it, radar is tracking (dashed — radar on prediction);
     thin orange — camera only (range from bbox height, "≤" if the box is clipped by the edge);
     red circle — moving radar with no pair. The number on the box is the range to the nearest point (radar)."""
     img = frame.copy()
     if fps is not None:
         _range_label(img, cam.w - 130, 26, f"{fps:4.1f} fps", (200, 200, 200), 0.55)
+    if ego_speed_mps is not None:
+        _range_label(img, cam.w - 130, 52, f"ego {ego_speed_mps:+4.1f} m/s", (180, 220, 180), 0.5)
     if radar_stale:
         _range_label(img, 8, 30, "RADAR LOST / STALE — camera only", (0, 60, 255), 0.7)
         fused = []
@@ -562,6 +573,8 @@ def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, 
                 cv2.putText(img, head, (x1 + 6, y1 + 62), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
                 _range_label(img, x1 + 6, y1 + 100, rtxt, color, 1.0)
             sub = f"{vr:+.1f} m/s"
+            if ego_speed_mps is not None and abs(ego_speed_mps) > 0.1:
+                sub += f" (ground {f.get('ground_speed_mps', 0.0):.1f})"
             if st == "both":
                 d = next((c for c in cam_dets if c.cam_id == f["cam_id"]), None)
                 if d is not None:
@@ -637,9 +650,13 @@ def run_live(dump=None):
         alert_engine = alerts.AlertEngine(sinks, resend_s=ALERT_RESEND_S, radar_only_confirm_s=RADAR_ONLY_CONFIRM_S,
                                           proximity_warn_m=PROXIMITY_WARN_M, proximity_critical_m=PROXIMITY_CRITICAL_M,
                                           closing_speed_mps=CLOSING_SPEED_ALERT_MPS)
+
+    ego_reader = ego_velocity.EgoVelocityReader(EGO_SERIAL_PORT, EGO_BAUD)   # no-ops to speed_mps=0.0 if EGO_SERIAL_PORT is ""
+
     t_start = time.time()
     clock = lambda: time.time() - t_start
-    snap = {"t": -1e9, "fused": [], "dets": [], "matched": {}, "tracks": [], "rdets": [], "rkinds": [], "radar_fps": 0.0}
+    snap = {"t": -1e9, "fused": [], "dets": [], "matched": {}, "tracks": [], "rdets": [], "rkinds": [], "radar_fps": 0.0,
+            "ego_speed_mps": 0.0}
     state = {"snap": snap, "error": None}
     stop = threading.Event()
 
@@ -667,15 +684,16 @@ def run_live(dump=None):
                         while clock() < t_next:
                             time.sleep(0.005)
                     t_now = clock()
+                    pipe.ego = ego_reader.speed_mps                       # live update — see ego_velocity.py
                     out = pipe.process(fr)
                     radar_fps.tick()
                     best = fus.nearest_camera_t(t_now)
                     dt_sync = (best[0] - t_now) if best is not None else 0.0
                     filtered = radar_filter.sync_and_filter(out["tracks"], dt_sync)
-                    fused, dets, matched = fus.on_radar(t_now, fr["frame"], filtered)
+                    fused, dets, matched = fus.on_radar(t_now, fr["frame"], filtered, ego_speed_mps=out["ego_speed_mps"])
                     state["snap"] = {"t": t_now, "fused": fused, "dets": dets, "matched": matched,
                                      "tracks": filtered, "rdets": out["dets"], "rkinds": out["kinds"],
-                                     "radar_fps": radar_fps.fps}
+                                     "radar_fps": radar_fps.fps, "ego_speed_mps": out["ego_speed_mps"]}
         except BaseException as e:                               # a thread dying shouldn't be silent
             state["error"] = f"{type(e).__name__}: {e}"
             print("RADAR STOPPED:", state["error"], flush=True)
@@ -703,7 +721,8 @@ def run_live(dump=None):
                 alert_engine.evaluate(t, s["fused"], dets, cam, stale)
             if SHOW_WINDOW:
                 img = draw_overlay(frame, s["fused"], dets, s["matched"], cam, s["tracks"], radar_stale=stale,
-                                   fps=fusion_fps.fps if SHOW_FPS else None)
+                                   fps=fusion_fps.fps if SHOW_FPS else None,
+                                   ego_speed_mps=s["ego_speed_mps"] if EGO_SERIAL_PORT else None)
                 cv2.imshow("fusion", img)
                 cv2.imshow("radar", radar.render(s["rdets"], s["rkinds"], [] if stale else s["tracks"], pipe.bg,
                                                  meters=radar.DRAW_METERS, only_ids=interesting_ids(s["fused"]),
@@ -715,6 +734,7 @@ def run_live(dump=None):
         stop.set(); cap.release(); fus.close()
         if alert_engine is not None:
             alert_engine.close()
+        ego_reader.close()
         try:
             cv2.destroyAllWindows()
         except cv2.error:

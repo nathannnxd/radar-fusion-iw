@@ -13,7 +13,7 @@
 numpy
 pandas
 scikit-learn        # DBSCAN clustering (iwr1642_live.cluster_objects)
-pyserial             # radar UART (CLI_PORT / DATA_PORT)
+pyserial             # radar UART (CLI_PORT / DATA_PORT), alerts.py's MCU port, ego_velocity.py's ESP32 port
 joblib               # loads radar_lightgbm_model.pkl
 lightgbm             # NOT imported directly anywhere in the code, but required to unpickle
                      # radar_lightgbm_model.pkl (joblib.load needs the class definitions available)
