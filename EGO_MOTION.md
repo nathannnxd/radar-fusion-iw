@@ -28,8 +28,7 @@ short drill session.
 ## 2. `$EGOVEL` sentence (ESP32 → Pi, 50 Hz) — v2, backward compatible
 
 ```
-$EGOVEL,<vx_mps>,<vy_mps>,<yaw_rate_dps>,<seq>,<flags>,<esp_ms>,<pitch_deg>,<roll_deg>,<acc_fwd_mps2>,<gyro_cal>*<XOR>
-
+$EGOVEL,<vx_mps>,<vy_mps>,<yaw_rate_dps>,<seq>,<flags>,<esp_ms>,<pitch_deg>,<roll_deg>,<acc_fwd_mps2>,<gyro_cal>*<XOR>
 ```
 Fields 1–5 are exactly the existing v1 sentence (`EGO_VELOCITY.md`): `vx` lateral **right +**, `vy` forward,
 `yaw_rate_dps` **+ = CCW from above = turning left** (same sign `Tracker.step(yaw_rate=...)` expects, in rad/s
