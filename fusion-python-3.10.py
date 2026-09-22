@@ -315,7 +315,7 @@ class Fusion:
         # the box doesn't extend past the frame: what's beyond the edge the camera wouldn't show anyway
         return (int(max(0, cu - bw / 2)), int(max(0, ny1)), int(min(self.cam.w - 1, cu + bw / 2)), int(min(self.cam.h - 1, ny2)))
 
-    def on_radar(self, t, radar_frame, tracks, ego_speed_mps=0.0):
+    def on_radar(self, t, radar_frame, tracks, ego_vx_mps=0.0, ego_vy_mps=0.0):
         cam_dets, dt, gray = self._nearest_camera(t)
         cam_dets = cam_dets or []
         cam_view = [self.cam.cam_view(float(tr.x[0]), float(tr.x[1])) for tr in tracks]   # (az_from_cam, depth)
@@ -398,14 +398,16 @@ class Fusion:
                 bbox = self._virtual_bbox(m, tr.range_m, az_from_cam)
                 m.reasons.append(lost_reason(m.ref_quality, frame_quality(gray, bbox)))
                 reason = max(set(m.reasons), key=list(m.reasons).count)
+            gvx, gvy = tr.ground_velocity(ego_vx_mps, ego_vy_mps)
             fused.append({
                 "radar_id": tr.id, "range_m": tr.range_m, "range_near_m": tr.range_near_m,
                 "azimuth_deg": tr.azimuth_deg, "az_from_cam": az_from_cam, "depth_m": depth,
                 "radial_mps": tr.radial_mps, "speed_mps": tr.speed_mps, "coasting": tr.coasting, "sigma_m": tr.sigma_xy_m,
                 # platform-relative (above) is what matters for closing-speed/collision judgments — left
-                # untouched. ground_speed_mps is the separate, ego-motion-compensated view: ~0 for a
-                # truly stationary object even while the platform itself is moving. See EGO_VELOCITY.md.
-                "ground_speed_mps": tr.ground_speed_mps(ego_speed_mps),
+                # untouched. ground_speed_mps/ground_vx_mps/ground_vy_mps are the separate, ego-motion-
+                # compensated view: ~0 for a truly stationary object even while the platform itself is
+                # moving or turning. See EGO_VELOCITY.md.
+                "ground_speed_mps": math.hypot(gvx, gvy), "ground_vx_mps": gvx, "ground_vy_mps": gvy,
                 "cam_id": (d.cam_id if d is not None else m.cam_id) if confirmed else None,
                 "fused_class": m.cls if confirmed else ("radar-only" if d is None else "pairing"),
                 "hits": m.hits if m else 0, "matched_now": d is not None,
@@ -522,7 +524,7 @@ def _dashed_rect(img, p1, p2, color, thick=2, dash=12):
 
 
 def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, radar_stale=False, fps=None,
-                 ego_speed_mps=None):
+                 ego_speed_mps=None, ego_yaw_rate_dps=None):
     """Green box — both sensors; cyan — camera lost it, radar is tracking (dashed — radar on prediction);
     thin orange — camera only (range from bbox height, "≤" if the box is clipped by the edge);
     red circle — moving radar with no pair. The number on the box is the range to the nearest point (radar)."""
@@ -530,7 +532,10 @@ def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, 
     if fps is not None:
         _range_label(img, cam.w - 130, 26, f"{fps:4.1f} fps", (200, 200, 200), 0.55)
     if ego_speed_mps is not None:
-        _range_label(img, cam.w - 130, 52, f"ego {ego_speed_mps:+4.1f} m/s", (180, 220, 180), 0.5)
+        ego_txt = f"ego {ego_speed_mps:+4.1f} m/s"
+        if ego_yaw_rate_dps is not None:
+            ego_txt += f"  yaw {ego_yaw_rate_dps:+5.1f}°/s"
+        _range_label(img, cam.w - 170, 52, ego_txt, (180, 220, 180), 0.5)
     if radar_stale:
         _range_label(img, 8, 30, "RADAR LOST / STALE — camera only", (0, 60, 255), 0.7)
         fused = []
@@ -656,7 +661,7 @@ def run_live(dump=None):
     t_start = time.time()
     clock = lambda: time.time() - t_start
     snap = {"t": -1e9, "fused": [], "dets": [], "matched": {}, "tracks": [], "rdets": [], "rkinds": [], "radar_fps": 0.0,
-            "ego_speed_mps": 0.0}
+            "ego_speed_mps": 0.0, "ego_yaw_rate_dps": 0.0}
     state = {"snap": snap, "error": None}
     stop = threading.Event()
 
@@ -684,16 +689,20 @@ def run_live(dump=None):
                         while clock() < t_next:
                             time.sleep(0.005)
                     t_now = clock()
-                    pipe.ego = ego_reader.speed_mps                       # live update — see ego_velocity.py
+                    pipe.ego = ego_reader.vy_mps                          # forward component only — matches what
+                                                                          # points_to_detections()/the trained model expect
+                    pipe.ego_yaw_rate_dps = ego_reader.yaw_rate_dps        # live update — see ego_velocity.py
                     out = pipe.process(fr)
                     radar_fps.tick()
                     best = fus.nearest_camera_t(t_now)
                     dt_sync = (best[0] - t_now) if best is not None else 0.0
                     filtered = radar_filter.sync_and_filter(out["tracks"], dt_sync)
-                    fused, dets, matched = fus.on_radar(t_now, fr["frame"], filtered, ego_speed_mps=out["ego_speed_mps"])
+                    fused, dets, matched = fus.on_radar(t_now, fr["frame"], filtered,
+                                                        ego_vx_mps=ego_reader.vx_mps, ego_vy_mps=ego_reader.vy_mps)
                     state["snap"] = {"t": t_now, "fused": fused, "dets": dets, "matched": matched,
                                      "tracks": filtered, "rdets": out["dets"], "rkinds": out["kinds"],
-                                     "radar_fps": radar_fps.fps, "ego_speed_mps": out["ego_speed_mps"]}
+                                     "radar_fps": radar_fps.fps, "ego_speed_mps": out["ego_speed_mps"],
+                                     "ego_yaw_rate_dps": out["ego_yaw_rate_dps"]}
         except BaseException as e:                               # a thread dying shouldn't be silent
             state["error"] = f"{type(e).__name__}: {e}"
             print("RADAR STOPPED:", state["error"], flush=True)
@@ -722,7 +731,8 @@ def run_live(dump=None):
             if SHOW_WINDOW:
                 img = draw_overlay(frame, s["fused"], dets, s["matched"], cam, s["tracks"], radar_stale=stale,
                                    fps=fusion_fps.fps if SHOW_FPS else None,
-                                   ego_speed_mps=s["ego_speed_mps"] if EGO_SERIAL_PORT else None)
+                                   ego_speed_mps=s["ego_speed_mps"] if EGO_SERIAL_PORT else None,
+                                   ego_yaw_rate_dps=s["ego_yaw_rate_dps"] if EGO_SERIAL_PORT else None)
                 cv2.imshow("fusion", img)
                 cv2.imshow("radar", radar.render(s["rdets"], s["rkinds"], [] if stale else s["tracks"], pipe.bg,
                                                  meters=radar.DRAW_METERS, only_ids=interesting_ids(s["fused"]),

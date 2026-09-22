@@ -477,20 +477,23 @@ class Track:
     sigma_xy_m = property(lambda s: float(math.sqrt(max(s.P[0, 0] + s.P[1, 1], 0.0))))
     coasting = property(lambda s: s.misses > 0)
 
-    def ground_velocity(self, ego_speed_mps):
+    def ground_velocity(self, ego_vx_mps=0.0, ego_vy_mps=0.0):
         """(vx, vy) in a stationary ground frame instead of the platform's own moving frame — i.e. what
         this object's velocity would read on a non-moving radar. x/vx, y/vy, radial_mps and speed_mps are
         deliberately left as platform-relative everywhere else (that's the correct frame for collision/
         closing-speed judgments — see EGO_VELOCITY.md); this is an additional, separate view for telling
         "this object is actually moving" from "it only looks like it's moving because the platform is".
 
-        ego_speed_mps is assumed purely forward (along +y, the platform's own heading) — no lateral
-        term, matching the same assumption points_to_detections() already makes for Doppler ego
-        compensation. A track's own vx is therefore unaffected; only vy shifts."""
-        return float(self.x[2]), float(self.x[3]) + ego_speed_mps
+        Takes the full 2D ego-velocity (ego_vx_mps lateral/right, ego_vy_mps forward — same x=right,
+        y=forward convention as everywhere else in this file) from ego_velocity.py's EgoVelocityReader.
+        Note this is a *different, more complete* correction than the single-scalar-forward assumption
+        Pipeline.ego / points_to_detections() still use for Doppler compensation — see EGO_VELOCITY.md
+        for why that one stays forward-only (it also feeds a model trained on that exact assumption) while
+        this one takes the full vector now that both components are actually available."""
+        return float(self.x[2]) + ego_vx_mps, float(self.x[3]) + ego_vy_mps
 
-    def ground_speed_mps(self, ego_speed_mps):
-        gvx, gvy = self.ground_velocity(ego_speed_mps)
+    def ground_speed_mps(self, ego_vx_mps=0.0, ego_vy_mps=0.0):
+        gvx, gvy = self.ground_velocity(ego_vx_mps, ego_vy_mps)
         return math.hypot(gvx, gvy)
 
     @property
@@ -687,6 +690,8 @@ def draw(dets, kinds, tracks, bg, meters=DRAW_METERS, title="", fps=None):
 class Pipeline:
     def __init__(self, cfg, model=None, ego_speed=0.0, use_background=USE_BACKGROUND):
         self.cfg, self.model, self.ego = cfg, model, ego_speed
+        self.ego_yaw_rate_dps = 0.0   # live-updatable, like self.ego; carried through only — not fed to
+                                      # points_to_detections/the model, see EGO_VELOCITY.md
         self.period = cfg.get("frame_period_s") or 0.1
         global DOPPLER_PERIOD
         DOPPLER_PERIOD = cfg.get("doppler_period_mps")
@@ -713,7 +718,8 @@ class Pipeline:
         tracks = self.tracker.step(objs, self.t, dt)
         noise = noise_floor(frame, self.cfg)
         return {"t": self.t, "dt": dt, "dets": dets, "kinds": kinds, "confs": confs,
-                "objs": objs, "tracks": tracks, "noise": noise, "ego_speed_mps": self.ego}
+                "objs": objs, "tracks": tracks, "noise": noise, "ego_speed_mps": self.ego,
+                "ego_yaw_rate_dps": self.ego_yaw_rate_dps}
 
 
 def main():
@@ -748,7 +754,9 @@ def main():
                 if frame is None:
                     continue
                 n += 1
-                pipe.ego = ego_reader.speed_mps            # live update — see ego_velocity.py
+                pipe.ego = ego_reader.vy_mps                # forward component only — matches what
+                                                            # points_to_detections()/the trained model expect
+                pipe.ego_yaw_rate_dps = ego_reader.yaw_rate_dps   # live update — see ego_velocity.py
                 out = pipe.process(frame)
                 fps_meter.tick()
                 if n % 5 == 0:
@@ -763,6 +771,7 @@ def main():
                 if log:
                     log.write(json.dumps({
                         "t": out["t"], "frame": frame["frame"], "ego_speed_mps": out["ego_speed_mps"],
+                        "ego_yaw_rate_dps": out["ego_yaw_rate_dps"],
                         "ego_moving": abs(out["ego_speed_mps"]) > 0.1, "noise": out["noise"],
                         "detections": [{**{k: v for k, v in d.items()}, "kind_pred": k_, "conf": round(float(c), 1)}
                                        for d, k_, c in zip(out["dets"], out["kinds"], out["confs"])],
