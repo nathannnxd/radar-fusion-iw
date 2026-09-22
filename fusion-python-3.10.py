@@ -29,6 +29,7 @@ import numpy as np
 import iwr1642_live as radar
 import radar_filter
 import alerts
+import ego_velocity
 
 try:
     import cv2
@@ -121,6 +122,7 @@ PROXIMITY_CRITICAL_M = code_config.get("PROXIMITY_CRITICAL_M", 1.5)  # ...and th
 CLOSING_SPEED_ALERT_MPS = code_config.get("CLOSING_SPEED_ALERT_MPS", 2.0)  # FAST_APPROACH threshold
 RADAR_ONLY_CONFIRM_S = code_config.get("RADAR_ONLY_CONFIRM_S", 1.0)  # radar-only object must persist this long before alerting (avoids alerting on a single-frame clutter blip)
 ALERT_RESEND_S = code_config.get("ALERT_RESEND_S", 2.0)              # heartbeat interval for an alert that's still active
+
 
 Q_SHARP_DROP = 0.45        # sharpness below 45 % of the reference
 Q_CONTRAST_DROP = 0.45     # contrast below 45 % of the reference
@@ -351,7 +353,7 @@ class Fusion:
         # the box doesn't extend past the frame: what's beyond the edge the camera wouldn't show anyway
         return (int(max(0, cu - bw / 2)), int(max(0, ny1)), int(min(self.cam.w - 1, cu + bw / 2)), int(min(self.cam.h - 1, ny2)))
 
-    def on_radar(self, t, radar_frame, tracks):
+    def on_radar(self, t, radar_frame, tracks, ego_vx_mps=0.0, ego_vy_mps=0.0):
         cam_dets, dt, gray = self._nearest_camera(t)
         cam_dets = cam_dets or []
         cam_view = [self.cam.cam_view(float(tr.x[0]), float(tr.x[1])) for tr in tracks]   # (az_from_cam, depth)
@@ -434,10 +436,16 @@ class Fusion:
                 bbox = self._virtual_bbox(m, tr.range_m, az_from_cam)
                 m.reasons.append(lost_reason(m.ref_quality, frame_quality(gray, bbox)))
                 reason = max(set(m.reasons), key=list(m.reasons).count)
+            gvx, gvy = tr.ground_velocity(ego_vx_mps, ego_vy_mps)
             fused.append({
                 "radar_id": tr.id, "range_m": tr.range_m, "range_near_m": tr.range_near_m,
                 "azimuth_deg": tr.azimuth_deg, "az_from_cam": az_from_cam, "depth_m": depth,
                 "radial_mps": tr.radial_mps, "speed_mps": tr.speed_mps, "coasting": tr.coasting, "sigma_m": tr.sigma_xy_m,
+                # platform-relative (above) is what matters for closing-speed/collision judgments — left
+                # untouched. ground_speed_mps/ground_vx_mps/ground_vy_mps are the separate, ego-motion-
+                # compensated view: ~0 for a truly stationary object even while the platform itself is
+                # moving or turning. See EGO_VELOCITY.md.
+                "ground_speed_mps": math.hypot(gvx, gvy), "ground_vx_mps": gvx, "ground_vy_mps": gvy,
                 "cam_id": (d.cam_id if d is not None else m.cam_id) if confirmed else None,
                 "fused_class": m.cls if confirmed else ("radar-only" if d is None else "pairing"),
                 "hits": m.hits if m else 0, "matched_now": d is not None,
@@ -563,13 +571,19 @@ def _dashed_rect(img, p1, p2, color, thick=2, dash=12):
                      (int(ax + (bx - ax) * s1), int(ay + (by - ay) * s1)), color, thick)
 
 
-def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, radar_stale=False, fps=None):
+def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, radar_stale=False, fps=None,
+                 ego_speed_mps=None, ego_yaw_rate_dps=None):
     """Green box — both sensors; cyan — camera lost it, radar is tracking (dashed — radar on prediction);
     thin orange — camera only (range from bbox height, "≤" if the box is clipped by the edge);
     red circle — moving radar with no pair. The number on the box is the range to the nearest point (radar)."""
     img = frame.copy()
     if fps is not None:
         _range_label(img, cam.w - 130, 26, f"{fps:4.1f} fps", (200, 200, 200), 0.55)
+    if ego_speed_mps is not None:
+        ego_txt = f"ego {ego_speed_mps:+4.1f} m/s"
+        if ego_yaw_rate_dps is not None:
+            ego_txt += f"  yaw {ego_yaw_rate_dps:+5.1f}°/s"
+        _range_label(img, cam.w - 170, 52, ego_txt, (180, 220, 180), 0.5)
     if radar_stale:
         _range_label(img, 8, 30, "RADAR LOST / STALE — camera only", (0, 60, 255), 0.7)
         fused = []
@@ -612,6 +626,8 @@ def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, 
                 cv2.putText(img, head, (x1 + 6, y1 + 62), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
                 _range_label(img, x1 + 6, y1 + 100, rtxt, color, 1.0)
             sub = f"{vr:+.1f} m/s"
+            if ego_speed_mps is not None and abs(ego_speed_mps) > 0.1:
+                sub += f" (ground {f.get('ground_speed_mps', 0.0):.1f})"
             if st == "both":
                 d = next((c for c in cam_dets if c.cam_id == f["cam_id"]), None)
                 if d is not None:
@@ -790,7 +806,7 @@ def run_live(dump=None):
     t_start = time.time()
     clock = lambda: time.time() - t_start
     snap = {"t": -1e9, "fused": [], "dets": [], "matched": {}, "tracks": [], "rdets": [], "rkinds": [], "radar_fps": 0.0,
-            "ego": {"v": 0.0, "valid": False, "moving": False, "n_inliers": 0, "source": "-"}}
+            "ego": {"v": 0.0, "vx": 0.0, "valid": False, "moving": False, "n_inliers": 0, "source": "-"}}
     state = {"snap": snap, "error": None}
     stop = threading.Event()
 
@@ -824,7 +840,8 @@ def run_live(dump=None):
                     best = fus.nearest_camera_t(t_now)
                     dt_sync = (best[0] - t_now) if best is not None else 0.0
                     filtered = radar_filter.sync_and_filter(out["tracks"], dt_sync, max_dt=fus.sync_window())
-                    fused, dets, matched = fus.on_radar(t_now, fr["frame"], filtered)
+                    fused, dets, matched = fus.on_radar(t_now, fr["frame"], filtered,
+                                                        ego_vx_mps=out["ego"].get("vx", 0.0), ego_vy_mps=out["ego"]["v"])
                     state["snap"] = {"t": t_now, "fused": fused, "dets": dets, "matched": matched,
                                      "tracks": filtered, "rdets": out["dets"], "rkinds": out["kinds"],
                                      "radar_fps": radar_fps.fps, "ego": out["ego"]}
@@ -868,7 +885,9 @@ def run_live(dump=None):
                 alert_engine.evaluate(t, s["fused"], dets, cam, stale)
             if SHOW_WINDOW:
                 img = draw_overlay(frame, s["fused"], dets, s["matched"], cam, s["tracks"], radar_stale=stale,
-                                   fps=fusion_fps.fps if SHOW_FPS else None)
+                                   fps=fusion_fps.fps if SHOW_FPS else None,
+                                   ego_speed_mps=s["ego"]["v"] if s["ego"].get("valid") else None,
+                                   ego_yaw_rate_dps=math.degrees(s["ego"].get("yaw_rate", 0.0)) if s["ego"].get("valid") else None)
                 cv2.imshow("fusion", display_scaled(img))
                 cv2.imshow("radar", display_scaled(radar.render(s["rdets"], s["rkinds"], [] if stale else s["tracks"], pipe.bg,
                                                  meters=radar.DRAW_METERS, only_ids=interesting_ids(s["fused"], s["ego"]),

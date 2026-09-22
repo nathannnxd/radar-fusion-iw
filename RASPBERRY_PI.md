@@ -155,6 +155,17 @@ more than older/cheaper "phone charger" USB power supplies provide — on either
 If you see random USB disconnects (the radar or camera dropping out), check the power supply first —
 that's not a code bug.
 
+## 8. Ego-velocity sensor (ESP32 + BNO08x)
+
+This branch includes `ego_velocity.py` and `firmware/ego_velocity/ego_velocity.ino` — see
+`EGO_VELOCITY.md` for the full design, wiring diagram, and limitations. It measures the platform's
+own forward velocity, lateral velocity, AND yaw (rotation) rate — the last of these because the
+radar itself has no way to measure how fast the platform is turning — over a dedicated UART/GPIO
+link (separate from the radar's own serial ports and from the alert system's MCU port — up to three
+independent serial links on the Pi if you're using everything at once) and feeds it into the
+pipeline's ego-motion compensation. Leave `EGO_SERIAL_PORT` empty in `configs.json` to run without
+it — nothing else changes, this is purely additive.
+
 ## 9. Alert system (MCU output)
 
 This branch includes `alerts.py` — see `ALERTS.md` for the full wire format, alert code table, and

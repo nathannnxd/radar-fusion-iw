@@ -36,6 +36,8 @@ try:
 except ImportError:
     DBSCAN = None
 
+import ego_velocity
+
 with open("configs.json", "r") as file:
     code_config = json.load(file)            # Read/edit configs.json
 # ---------------------------------------------------------------- SETTINGS
@@ -45,7 +47,11 @@ CFG_FILE = code_config["RADAR_CONFIG"]
 MODEL_PATH = "radar_lightgbm_model.pkl"      # our own .pkl; the /content/drive/... path doesn't exist on the laptop
 DUMP_FILE = None                             # "radar_dump.bin" — replay a recording without ports
 SEND_CFG = True                              # False if the radar is already streaming (e.g. started from Visualizer)
-EGO_SPEED_MPS = 0.0                          # carrier speed, m/s; 0 on the bench, from odometry on the tractor
+EGO_SPEED_MPS = 0.0                          # carrier speed, m/s; 0 on the bench. Overridden live in main() by
+                                             # EGO_SERIAL_PORT below if set — this is only the value used before
+                                             # the first reading arrives, or if that port is left empty (disabled)
+EGO_SERIAL_PORT = code_config.get("EGO_SERIAL_PORT", "")   # ESP32+IMU port (see ego_velocity.py / EGO_VELOCITY.md); "" — disabled
+EGO_BAUD = code_config.get("EGO_BAUD", 115200)
 SHOW_WINDOW = True                           # OpenCV window
 SHOW_FPS = code_config["SHOW_FPS"]           # 1 — draw the fps counter on the display; 0 — off
 DRAW_METERS = 15                             # image radius, m: 10 for a room, 30–50 for a field
@@ -582,6 +588,25 @@ class Track:
     sigma_xy_m = property(lambda s: float(math.sqrt(max(s.P[0, 0] + s.P[1, 1], 0.0))))
     coasting = property(lambda s: s.misses > 0)
 
+    def ground_velocity(self, ego_vx_mps=0.0, ego_vy_mps=0.0):
+        """(vx, vy) in a stationary ground frame instead of the platform's own moving frame — i.e. what
+        this object's velocity would read on a non-moving radar. x/vx, y/vy, radial_mps and speed_mps are
+        deliberately left as platform-relative everywhere else (that's the correct frame for collision/
+        closing-speed judgments — see EGO_VELOCITY.md); this is an additional, separate view for telling
+        "this object is actually moving" from "it only looks like it's moving because the platform is".
+
+        Takes the full 2D ego-velocity (ego_vx_mps lateral/right, ego_vy_mps forward — same x=right,
+        y=forward convention as everywhere else in this file) from ego_velocity.py's EgoVelocityReader.
+        Note this is a *different, more complete* correction than the single-scalar-forward assumption
+        Pipeline.ego / points_to_detections() still use for Doppler compensation — see EGO_VELOCITY.md
+        for why that one stays forward-only (it also feeds a model trained on that exact assumption) while
+        this one takes the full vector now that both components are actually available."""
+        return float(self.x[2]) + ego_vx_mps, float(self.x[3]) + ego_vy_mps
+
+    def ground_speed_mps(self, ego_vx_mps=0.0, ego_vy_mps=0.0):
+        gvx, gvy = self.ground_velocity(ego_vx_mps, ego_vy_mps)
+        return math.hypot(gvx, gvy)
+
     @property
     def kind(self):
         """Track class — votes from points accumulated over its lifetime, not the last frame's answer."""
@@ -796,6 +821,7 @@ class Pipeline:
         self.ego_info = {"v": ego_speed, "vx": 0.0, "valid": self.ego_mode == "fixed",
                          "moving": abs(ego_speed) >= EGO_STATIONARY_MPS, "n_inliers": 0, "n_points": 0,
                          "az_spread_deg": 0.0, "ambiguous": False, "yaw_rate": 0.0, "source": self.ego_mode}
+        self.ego_yaw_rate_dps = 0.0   # deg/s, + = left; carried through for the overlay/JSONL (EGO_VELOCITY.md)
         self.period = cfg.get("frame_period_s") or 0.1
         global DOPPLER_PERIOD
         DOPPLER_PERIOD = cfg.get("doppler_period_mps")
@@ -837,7 +863,8 @@ class Pipeline:
         tracks = self.tracker.step(objs, self.t, dt, yaw_rate=yaw_rate or 0.0)
         noise = noise_floor(frame, self.cfg)
         return {"t": self.t, "dt": dt, "dets": dets, "kinds": kinds, "confs": confs,
-                "objs": objs, "tracks": tracks, "noise": noise, "ego": dict(self.ego_info)}
+                "objs": objs, "tracks": tracks, "noise": noise, "ego": dict(self.ego_info),
+                "ego_speed_mps": self.ego, "ego_yaw_rate_dps": self.ego_yaw_rate_dps}
 
 
 def main():
@@ -855,6 +882,7 @@ def main():
               f"need a profile with ≥ 5 m/s")
 
     pipe = Pipeline(cfg, model, EGO_SPEED_MPS)
+    ego_reader = ego_velocity.EgoVelocityReader(EGO_SERIAL_PORT, EGO_BAUD)   # no-ops to speed_mps=0.0 if EGO_SERIAL_PORT is ""
     log = open(f"frames_{datetime.now():%Y%m%d_%H%M%S}.jsonl", "w", encoding="utf-8") if LOG_JSONL else None
     fps_meter = FpsMeter()
     buffer, n, t0 = b"", 0, time.time()
@@ -871,7 +899,8 @@ def main():
                 if frame is None:
                     continue
                 n += 1
-                out = pipe.process(frame)
+                pipe.ego_yaw_rate_dps = ego_reader.yaw_rate_dps   # gyro yaw rate from the ESP32 (0 when no link)
+                out = pipe.process(frame, yaw_rate=math.radians(ego_reader.yaw_rate_dps))   # speed: EGO_MODE (radar)
                 fps_meter.tick()
                 if n % 5 == 0:
                     fps = n / max(time.time() - t0, 1e-6)
@@ -884,8 +913,9 @@ def main():
                               f"{tr.radial_mps:+5.2f} m/s  |v|={tr.speed_mps:4.2f}  hits {tr.hits:3d}  {st}")
                 if log:
                     log.write(json.dumps({
-                        "t": out["t"], "frame": frame["frame"], "ego_speed_mps": EGO_SPEED_MPS,
-                        "ego_moving": abs(EGO_SPEED_MPS) > 0.1, "noise": out["noise"],
+                        "t": out["t"], "frame": frame["frame"], "ego_speed_mps": out["ego_speed_mps"],
+                        "ego_yaw_rate_dps": out["ego_yaw_rate_dps"],
+                        "ego_moving": abs(out["ego_speed_mps"]) > 0.1, "noise": out["noise"],
                         "detections": [{**{k: v for k, v in d.items()}, "kind_pred": k_, "conf": round(float(c), 1)}
                                        for d, k_, c in zip(out["dets"], out["kinds"], out["confs"])],
                         "radar_tracks": [tr.contract() for tr in out["tracks"]],
@@ -896,6 +926,7 @@ def main():
     except KeyboardInterrupt:
         print("\n⏹ Stopped.")
     finally:
+        ego_reader.close()
         if log:
             log.close()
         if cv2 is not None:
