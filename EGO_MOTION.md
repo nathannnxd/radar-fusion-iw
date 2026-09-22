@@ -12,25 +12,36 @@ short drill session.
   Profiles: `radar_configs/hangar_v9.cfg` (v_max 8.7 m/s, bin 0.27 m/s, ~18 m) indoors / hangar,
   `radar_configs/field_v15.cfg` (v_max 14.8 m/s, bin 0.23 m/s, ~40 m) in the field.
   `clutterRemoval 0`, `extendedMaxVelocity 0` (only after TI phase calibration with a corner reflector).
-- IMU: BNO085 on the **ESP32 over SPI** (the chip's I2C erratum; the esp32_BNO08x driver is SPI-only).
-  ESP32 streams `$RDEGO` sentences on the same USB serial it receives `$RDALT` alerts on.
-- Pi 4 (Python): `iwr1642_live.py` (radar pipeline), `fusion-python-3.10.py` (camera fusion + alerts),
-  `record_sync.py` (logging), `fusion_offline.py` (replay).
+- IMU: BNO08x on the ESP32 over **I2C** (Adafruit_BNO08x library, address 0x4B, INT 4 / RESET 15 — the
+  wiring and firmware the team already has in `firmware/ego_velocity/ego_velocity.ino`, see
+  `EGO_VELOCITY.md`). The ESP32 streams `$EGOVEL` sentences out **Serial2 (GPIO17 TX2 → Pi GPIO15/pin 10 RXD,
+  GPIO16 RX2 ← Pi GPIO14/pin 8 TXD, common GND)** at 115200; its USB `Serial` stays free for flashing and
+  for the `$RDALT` alert node (the same board can run both: alerts in over USB, IMU out over Serial2).
+  On the Pi the port is `/dev/ttyAMA0` or `/dev/ttyS0` (`EGO_SERIAL_PORT`).
+- Pi 4 (Python): `iwr1642_live.py` (radar pipeline), `ego_velocity.py` (IMU link — extended here, replaces
+  the interim `EgoLink` in fusion), `fusion-python-3.10.py` (camera fusion + alerts), `record_sync.py`
+  (logging), `fusion_offline.py` (replay).
+- Speed policy: the **radar Doppler fit is the primary speed**; the ESP32's integrated velocity (`vy_mps`,
+  ZUPT-bounded dead reckoning) is only a **bridge** while the radar state is UNKNOWN (≤ 2 s) and an input
+  to the STANDING decision (its ZUPT flag) — never the operational speed on its own.
 
-## 2. `$RDEGO` sentence (ESP32 -> Pi, 50 Hz)
+## 2. `$EGOVEL` sentence (ESP32 → Pi, 50 Hz) — v2, backward compatible
 
 ```
-$RDEGO,<esp_ms>,<yaw_rate_dps>,<pitch_deg>,<roll_deg>,<acc_fwd_mps2>,<gyro_cal>,<v_mps>*<XOR checksum>\r\n
+$EGOVEL,<vx_mps>,<vy_mps>,<yaw_rate_dps>,<seq>,<flags>,<esp_ms>,<pitch_deg>,<roll_deg>,<acc_fwd_mps2>,<gyro_cal>*<XOR>
+
 ```
-- `esp_ms` — ESP32 millis() at the IMU sample (monotonic; the Pi maps it to its own clock by a running
-  offset = median(t_rx_pi - esp_ms/1000) over the last 2 s minus a fixed USB latency guess of 5 ms).
-- `yaw_rate_dps` — BNO085 *Calibrated Gyroscope* Z, deg/s, **+ = turning left (CCW from above)** —
-  the same sign as `Tracker.step(yaw_rate=...)` expects (rad/s inside Python).
+Fields 1–5 are exactly the existing v1 sentence (`EGO_VELOCITY.md`): `vx` lateral **right +**, `vy` forward,
+`yaw_rate_dps` **+ = CCW from above = turning left** (same sign `Tracker.step(yaw_rate=...)` expects, in rad/s
+inside Python), `seq` 0–255, `flags` bit 0 = ZUPT active. v2 appends:
+- `esp_ms` — ESP32 `millis()` at the IMU sample; the Pi maps it to its clock with a running offset
+  `median(t_rx_pi − esp_ms/1000)` over the last 2 s minus a fixed 5 ms link latency guess.
 - `pitch_deg`, `roll_deg` — from the Game Rotation Vector (no magnetometer: steel chassis); nose-up +.
-- `acc_fwd_mps2` — linear acceleration along the tractor's forward axis (gravity removed by the chip).
-- `gyro_cal` — BNO085 calibration status 0..3.
-- `v_mps` — empty for now (reserved for a later GNSS/Hall speed); empty fields mean "unknown".
-Checksum exactly as `$RDALT` (XOR of the characters between `$` and `*`, two hex digits).
+- `acc_fwd_mps2` — bias-corrected forward linear acceleration (already computed for the ZUPT).
+- `gyro_cal` — BNO08x gyroscope accuracy status 0..3.
+Empty fields mean "unknown". The reader accepts both the 5-field v1 and the 10-field v2 sentence
+(v2 fields default to unknown/0 for v1) — a v1 firmware keeps working, a mismatched field count is still
+rejected loudly. Checksum: XOR of the characters between `$` and `*`, two uppercase hex digits.
 
 ## 3. Calibration constants (`configs.json`)
 
@@ -87,11 +98,16 @@ Tracker / background: `Tracker.step(..., yaw_rate=ω_gyro)` unchanged; `Backgrou
 
 ## 5. Fusion layer (`fusion-python-3.10.py`)
 
-- `EgoLink`: parse the §2 sentence; keep a 2-s ring buffer of samples with Pi timestamps; `sample_at(t)`
-  returns the linearly interpolated `{yaw_rate, pitch, roll, acc_fwd, gyro_ok, age_s}` for
-  `t + EGO_TIME_OFFSET_S`; bias removal with `EGO_GYRO_BIAS_DPS`; `gyro_ok = gyro_cal ≥ 2 and age ≤ 0.2 s`.
-- Standstill bias refresh: when the radar reports `STANDING` for ≥ 3 s, average the raw gyro Z and store
-  it (`configs.json` write-back on clean exit).
+- `ego_velocity.EgoVelocityReader` (extended; the interim `EgoLink` class in fusion is removed): parse the §2
+  sentence (v1 and v2); keep a 2-s ring buffer of samples with Pi timestamps; `sample_at(t)` returns the
+  linearly interpolated `{yaw_rate (rad/s, + left, bias-removed), pitch, roll, acc_fwd, vy_imu, zupt,
+  gyro_ok, age_s}` for `t + EGO_TIME_OFFSET_S`; bias removal with `EGO_GYRO_BIAS_DPS`;
+  `gyro_ok = gyro_cal ≥ 2 (or unknown on v1) and age ≤ 0.2 s`; the existing `vx_mps/vy_mps/yaw_rate_dps`
+  properties stay for backward compatibility. Add `feed_line(line, t_rx)` for tests.
+- Standstill bias refresh: when the radar reports `STANDING` for ≥ 3 s (the IMU's ZUPT flag is a supporting
+  input), average the raw gyro Z and store it (`configs.json` write-back on clean exit, that key only).
+- `Track.ground_velocity(ego_vx, ego_vy)` (upstream) is fed with the radar-fit speed (`ego_info["v"]`) and
+  the fit's lateral component, not the IMU's integrated velocity.
 - Corridor: half-width `CORRIDOR_HALF_WIDTH_M` (track + implement/2 + 0.3 m margin); look-ahead
   `max(6 m, v·TTC_WARN_S·1.3)`; when `v ≥ 0.7 m/s` bend the corridor with curvature `κ = ω/v`
   (lateral offset ≈ κ·y²/2), else a straight box.
@@ -106,9 +122,9 @@ Tracker / background: `Tracker.step(..., yaw_rate=ω_gyro)` unchanged; `Backgrou
 
 ## 6. Logging, replay, calibration tools
 
-- `record_sync.py`: logs radar frames (existing), `$RDEGO` lines with Pi receive time, camera detections;
+- `record_sync.py`: logs radar frames (existing), `$EGOVEL` lines with Pi receive time, camera detections;
   one `.jsonl` per run, gzip; `--tag` names the drill.
-- `fusion_offline.py --log <file>`: replays with the same code path (`Pipeline.process` + `EgoLink`
+- `fusion_offline.py --log <file>`: replays with the same code path (`Pipeline.process` + `EgoVelocityReader.sample_at`
   fed from the log), prints the per-frame `ego_info` and a summary (mean/median v per segment, state
   histogram, false-moving rate on points the user marks static via `--static-mask`).
 - `tools/calib_time_offset.py <log>`: (a) replay grid search over `EGO_TIME_OFFSET_S ∈ [−0.4, +0.1] s`
@@ -117,6 +133,14 @@ Tracker / background: `Tracker.step(..., yaw_rate=ω_gyro)` unchanged; `Backgrou
   frame period; pass criterion: |a − b| < 1 frame.
 - `tools/calib_mount.py <log_fwd> <log_back>`: mounting yaw from straight drives.
 - `tools/drills.md`: the checklist for the tractor session with pass/fail numbers (from the report).
+
+## 6b. Firmware (`firmware/ego_velocity/ego_velocity.ino`)
+
+Extend the existing sketch, do not rewrite it: enable `SH2_GAME_ROTATION_VECTOR` (50 Hz) next to the
+linear-acceleration and calibrated-gyro reports; derive pitch/roll from the quaternion; emit the v2 sentence
+with `millis()` and the gyro accuracy status; keep the ZUPT and startup bias logic; add the `$RDALT`
+alert-node handling (LEDs/buzzer, from `esp32/alert_node/alert_node.ino`) on the USB `Serial` behind a
+`#define ALERT_NODE 1` so one ESP32 can do both jobs. Keep `FORWARD_SIGN`/`RIGHT_SIGN`.
 
 ## 7. Alert codes added (see ALERTS.md)
 
@@ -130,7 +154,7 @@ Synthetic: (A) standing scene — state STANDING, v = 0; (B) straight drive at 0
 wrapped Doppler on the old profile vs unwrapped on hangar_v9 — |v − v_true| < 0.5·bin; (C) turn at
 ω = 0.3 rad/s with lever arm 2 m — with gyro, |v − v_true| < 0.5·bin (fix the sign bug in the old test C:
 `th = w*dt*k`); (D) one large mover covering 60 % of points — gate holds the previous value; (E) narrow
-azimuth spread — `ambiguous`, hold; (F) `$RDEGO` parsing, checksum, interpolation and bias removal;
+azimuth spread — `ambiguous`, hold; (F) `$EGOVEL` v1/v2 parsing, checksum, seq drops, interpolation, time offset and bias removal;
 (G) `calib_time_offset` recovers an injected offset of −120 ms within 20 ms.
 Recorded: `test_stationary_stand.bin` → STANDING ≥ 95 % of frames; `test_stationary_walk.bin` → the
 walker is `moving`, the background static.
