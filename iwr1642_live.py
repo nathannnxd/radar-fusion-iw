@@ -13,7 +13,7 @@ import json
 import math
 import struct
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 
 import numpy as np
@@ -231,6 +231,108 @@ def points_to_detections(frame, cfg, ego_speed):
     return dets
 
 
+# ---------------------------------------------------------------- ego-motion from the point cloud
+EGO_MODE = code_config.get("EGO_MODE", "radar")   # "radar": carrier speed from the frame's stationary targets, every frame
+                                                  # "fixed": EGO_SPEED_MPS (bench)
+                                                  # "external": only what Pipeline.process(frame, ego_speed=...) is given
+EGO_MIN_POINTS = 6                            # fewer usable points — no estimate this frame (hold the last one)
+EGO_MIN_RANGE_M = 1.0                         # closer points are antenna leakage / the carrier itself
+EGO_INLIER_TOL_MPS = 0.06                     # inlier tolerance = 0.75 x Doppler resolution + this: a stationary target's
+                                              # Doppler is quantised to +-res/2; anything looser lets slow walkers vote
+EGO_MIN_INLIER_FRAC = 0.4                     # the stationary-world model must explain at least this share of the points
+EGO_MEDIAN_FRAMES = 5                         # reported speed = median of the last N raw estimates (kills 1-frame flips)
+EGO_MAX_ACCEL_MPS2 = 4.0                      # a tractor can't change speed faster: rate limit on the estimate
+EGO_HOLD_S = 1.0                              # keep the last valid estimate this long without evidence, then fall to 0
+EGO_STATIONARY_MPS = 0.15                     # |v| below this — the carrier is standing (the background map may learn)
+EGO_SEARCH_MPS = (-3.0, 15.0)                 # speeds considered (reverse .. fast forward), grid step 0.05 m/s
+
+
+class EgoEstimator:
+    """Carrier speed from the radar alone (Kellner et al., "Instantaneous ego-motion estimation using Doppler radar",
+    ITSC 2013). A stationary target seen from a sensor moving forward at v shows Doppler -v*cos(az) (TI: + = receding).
+    Outdoors most targets are stationary (ground, posts, crop, walls), so a robust fit over one frame's points gives v
+    with no odometry at all: grid search on the inlier count -> IRLS least squares on the inliers -> median -> rate
+    limit. Residuals are wrapped by the Doppler period, so targets aliased beyond the profile's v_max still vote
+    correctly as long as the points are spread in azimuth (with a narrow spread v and v +- period are indistinguishable
+    -> the candidate nearest the previous estimate wins and `ambiguous` is flagged). Two parameters (forward vy,
+    lateral vx) absorb side-slip and the yaw-induced lateral term; only vy is reported as the carrier speed."""
+
+    def __init__(self):
+        self.v, self.vx, self.valid, self.t_valid = 0.0, 0.0, False, None
+        self.n_inliers, self.n_points, self.az_spread_deg, self.ambiguous = 0, 0, 0.0, False
+        self.raw = 0.0                                                      # this frame's unfiltered estimate
+        self.hist = deque(maxlen=EGO_MEDIAN_FRAMES)
+        lo, hi = EGO_SEARCH_MPS
+        self.grid = np.arange(lo, hi + 1e-9, 0.05)
+
+    @property
+    def moving(self):
+        return self.valid and abs(self.v) >= EGO_STATIONARY_MPS
+
+    def info(self):
+        return {"v": round(self.v, 3), "vx": round(self.vx, 3), "raw": round(self.raw, 3), "valid": self.valid,
+                "moving": self.moving, "n_inliers": self.n_inliers, "n_points": self.n_points,
+                "az_spread_deg": round(self.az_spread_deg, 1), "ambiguous": self.ambiguous}
+
+    def _hold(self, t):
+        """No usable estimate this frame: keep the last one for EGO_HOLD_S, then decay to 'standing, unknown'."""
+        if self.t_valid is not None and (t - self.t_valid) <= EGO_HOLD_S:
+            return self.v
+        self.v, self.vx, self.valid, self.n_inliers = 0.0, 0.0, False, 0
+        return self.v
+
+    def estimate(self, dets, t, dt, period=None, doppler_res=None):
+        tol = 0.75 * (doppler_res or 0.13) + EGO_INLIER_TOL_MPS
+        pts = [(d["azimuth_rad"], d["doppler_mps"]) for d in dets
+               if d["range_m"] >= EGO_MIN_RANGE_M and d["snr_db"] == d["snr_db"]]       # no leakage, no NaN-SNR points
+        self.n_points = len(pts)
+        if len(pts) < EGO_MIN_POINTS:
+            return self._hold(t)
+        az = np.array([p[0] for p in pts]); vm = np.array([p[1] for p in pts])
+        cos_az, sin_az = np.cos(az), np.sin(az)
+        # residual of every point under every candidate speed: v_meas + v_c*cos(az) (= 0 for a stationary target)
+        res = vm[None, :] + self.grid[:, None] * cos_az[None, :]
+        if period:
+            res -= np.round(res / period) * period                                  # aliased targets still count
+        inl = np.abs(res) < tol
+        counts = inl.sum(axis=1)
+        best = int(counts.max())
+        if best < EGO_MIN_POINTS or best < EGO_MIN_INLIER_FRAC * len(pts):
+            return self._hold(t)
+        cands = self.grid[counts >= best - 1]                                        # near-ties: standing wins,
+        i0 = int(np.argmin(np.abs(self.grid)))                                       # then the previous value
+        if counts[i0] >= best - 1:
+            cands = np.array([0.0])
+        ref = self.v if self.valid else 0.0
+        v0 = float(cands[np.argmin(np.abs(cands - ref))])
+        self.ambiguous = bool(period) and float(cands.max() - cands.min()) > 0.6 * period
+        sel = inl[int(np.argmin(np.abs(self.grid - v0)))]
+        # least squares on the inliers, 2 parameters: v_meas = -(vy*cos az + vx*sin az), Doppler unwrapped around v0
+        vv = vm[sel]
+        if period:
+            vv = vv - np.round((vv + v0 * cos_az[sel]) / period) * period
+        A = np.column_stack([cos_az[sel], sin_az[sel]])
+        w = np.ones(len(vv))
+        sol = np.array([v0, 0.0])
+        for _ in range(3):                                                             # IRLS (Tukey): near-tolerance
+            sol, *_ = np.linalg.lstsq(A * w[:, None], -vv * w, rcond=None)              # outliers stop pulling the fit
+            rres = vv + A @ sol
+            w = np.clip(1 - (rres / tol) ** 2, 0.0, None)
+        vy, vx = float(sol[0]), float(sol[1])
+        if not (np.isfinite(vy) and np.isfinite(vx)):
+            return self._hold(t)
+        self.az_spread_deg = math.degrees(float(az[sel].max() - az[sel].min()))
+        self.n_inliers = int(sel.sum())
+        self.raw = vy
+        self.hist.append(vy)
+        vy = float(np.median(self.hist))
+        if self.valid and dt > 0:                                                     # a tractor doesn't jump
+            lim = EGO_MAX_ACCEL_MPS2 * dt
+            vy = min(max(vy, self.v - lim), self.v + lim)
+        self.v, self.vx, self.valid, self.t_valid = vy, vx, True, t
+        return self.v
+
+
 # ---------------------------------------------------------------- background map
 class BackgroundMap:
     """Occupancy grid for a stationary radar. Learns for the first learn_s seconds: a cell where a static
@@ -394,6 +496,15 @@ class Track:
         self.x, self.P = self.step_state(self.x, self.P, dt)
         self.age += 1
 
+    def rotate(self, theta):
+        """Rotate the state (position and velocity) about the sensor by theta (rad, counter-clockwise seen from above,
+        x right / y forward). Used when the carrier yaws: the world turns the other way in the sensor frame."""
+        c, s_ = math.cos(theta), math.sin(theta)
+        R = np.array([[c, -s_], [s_, c]])
+        M = np.zeros((4, 4)); M[:2, :2] = R; M[2:, 2:] = R
+        self.x = M @ self.x
+        self.P = M @ self.P @ M.T
+
     def _h(self, x):
         r = max(math.hypot(x[0], x[1]), 1e-3)
         vr = (x[0] * x[2] + x[1] * x[3]) / r
@@ -501,8 +612,11 @@ class Tracker:
         self.gate, self.merge_m = gate, merge_m
         self.tracks = []
 
-    def step(self, objs, t, dt):
+    def step(self, objs, t, dt, yaw_rate=0.0):
+        """yaw_rate — carrier turn rate, rad/s, + = turning left (counter-clockwise from above)."""
         for tr in self.tracks:
+            if yaw_rate:
+                tr.rotate(-yaw_rate * dt)            # the carrier turned left by w*dt -> the world turned right
             tr.predict(dt)
         cand = sorted((tr.gate_distance(o), i, j) for i, tr in enumerate(self.tracks)
                       for j, o in enumerate(objs) if tr.gate_distance(o) < self.gate)
@@ -597,7 +711,17 @@ class FpsMeter:
         return self.fps
 
 
-def render(dets, kinds, tracks, bg, meters=DRAW_METERS, title="", only_ids=None, fps=None):
+def ego_label(ego):
+    """One-line carrier-motion status for the on-screen views."""
+    if not ego or not ego.get("valid"):
+        return "ego: n/a"
+    src = ego.get("source", "-")
+    if src == "radar":
+        src += f" {ego.get('n_inliers', 0)}/{ego.get('n_points', 0)} pts" + (" ?" if ego.get("ambiguous") else "")
+    return f"ego {ego['v']:+.2f} m/s ({src})" if ego.get("moving") else f"ego: standing ({src})"
+
+
+def render(dets, kinds, tracks, bg, meters=DRAW_METERS, title="", only_ids=None, fps=None, ego=None):
     """Top-down view frame (BGR 500×540): points by type, tracks with ID, trail, and speed arrow.
     Used by both the live window and video recording (RECORD_VIDEO)."""
     meters = max(1, int(round(meters)))
@@ -645,8 +769,10 @@ def render(dets, kinds, tracks, bg, meters=DRAW_METERS, title="", only_ids=None,
         cv2.putText(img, f"{fps:4.1f} fps", (W - 90, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 150, 150), 1)
     if title:
         cv2.putText(img, title, (8, H0 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 150, 150), 1)
+    if ego is not None:                                       # carrier motion, second status line at the top
+        cv2.putText(img, ego_label(ego), (8, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 220, 255), 1)
     # legend
-    y = 30
+    y = 46 if ego is not None else 30
     for k, c in (("target", POINT_CLASS_COLOR["target"]), ("target_micro", POINT_CLASS_COLOR["target_micro"]),
                  ("clutter", POINT_CLASS_COLOR["clutter"]), ("background", POINT_CLASS_COLOR["background"])):
         cv2.circle(img, (12, y), 3, c, -1); cv2.putText(img, k, (20, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (120, 120, 120), 1); y += 14
@@ -663,8 +789,13 @@ def draw(dets, kinds, tracks, bg, meters=DRAW_METERS, title="", fps=None):
 
 # ---------------------------------------------------------------- one frame (also used in tests)
 class Pipeline:
-    def __init__(self, cfg, model=None, ego_speed=0.0, use_background=USE_BACKGROUND):
+    def __init__(self, cfg, model=None, ego_speed=0.0, use_background=USE_BACKGROUND, ego_mode=None):
         self.cfg, self.model, self.ego = cfg, model, ego_speed
+        self.ego_mode = ego_mode or EGO_MODE
+        self.ego_est = EgoEstimator()
+        self.ego_info = {"v": ego_speed, "vx": 0.0, "valid": self.ego_mode == "fixed",
+                         "moving": abs(ego_speed) >= EGO_STATIONARY_MPS, "n_inliers": 0, "n_points": 0,
+                         "az_spread_deg": 0.0, "ambiguous": False, "yaw_rate": 0.0, "source": self.ego_mode}
         self.period = cfg.get("frame_period_s") or 0.1
         global DOPPLER_PERIOD
         DOPPLER_PERIOD = cfg.get("doppler_period_mps")
@@ -673,7 +804,10 @@ class Pipeline:
         self.tracker = Tracker()
         self.last_frame_num, self.t = None, 0.0
 
-    def process(self, frame):
+    def process(self, frame, ego_speed=None, yaw_rate=0.0):
+        """ego_speed — carrier speed for this frame from an external source (m/s, forward +), wins over EGO_MODE;
+        None: "radar" estimates it from the frame's stationary targets, "fixed" keeps the constant.
+        yaw_rate — carrier turn rate (rad/s, + = left) from a gyro; 0 when unknown."""
         # time — from the radar frame number: dropped USB packets don't compress the tracker's time
         if self.last_frame_num is not None:
             gap = frame["frame"] - self.last_frame_num
@@ -683,15 +817,27 @@ class Pipeline:
         self.last_frame_num = frame["frame"]
         self.t += dt
 
-        dets = points_to_detections(frame, self.cfg, self.ego)
+        dets = points_to_detections(frame, self.cfg, 0.0)              # raw first: the estimate needs uncompensated Doppler
+        if ego_speed is not None:
+            self.ego = float(ego_speed)
+            self.ego_info = {"v": self.ego, "vx": 0.0, "valid": True, "moving": abs(self.ego) >= EGO_STATIONARY_MPS,
+                             "n_inliers": 0, "n_points": 0, "az_spread_deg": 0.0, "ambiguous": False, "source": "external"}
+        elif self.ego_mode == "radar":
+            self.ego = self.ego_est.estimate(dets, self.t, dt, DOPPLER_PERIOD, self.cfg.get("doppler_res_mps"))
+            self.ego_info = {**self.ego_est.info(), "source": "radar"}
+        self.ego_info["yaw_rate"] = float(yaw_rate or 0.0)
+        if self.ego != 0.0:                                              # compensate: ~0 for a stationary target
+            for d in dets:
+                d["doppler_rel_mps"] = d["doppler_mps"] + self.ego * math.cos(d["azimuth_rad"])
+                d["is_static"] = abs(d["doppler_rel_mps"]) < STATIC_DOPPLER_MPS
         if self.bg is not None:
-            dets = self.bg.mark(dets, self.t, self.ego)
+            dets = self.bg.mark(dets, self.t, self.ego)                 # learns / applies only while standing
         kinds, confs = predict_points(self.model, dets, self.ego, abs(self.ego) > 0.1)
         objs = cluster_objects(dets, kinds, confs)
-        tracks = self.tracker.step(objs, self.t, dt)
+        tracks = self.tracker.step(objs, self.t, dt, yaw_rate=yaw_rate or 0.0)
         noise = noise_floor(frame, self.cfg)
         return {"t": self.t, "dt": dt, "dets": dets, "kinds": kinds, "confs": confs,
-                "objs": objs, "tracks": tracks, "noise": noise}
+                "objs": objs, "tracks": tracks, "noise": noise, "ego": dict(self.ego_info)}
 
 
 def main():

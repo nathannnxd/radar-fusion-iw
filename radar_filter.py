@@ -21,15 +21,16 @@ import iwr1642_live as radar
 REJECT_MAX_MISSES = 3            # coasting longer than this (frames) isn't fed to fusion
 REJECT_SIGMA_XY_M = 1.2          # EKF position uncertainty (post-sync) too large to trust
 REJECT_SPEED_MPS = 15.0          # implausible speed for this scene — sanity cap, not a real limit
-SYNC_MAX_EXTRAPOLATION_S = 0.25  # |dt| beyond this: drop the whole frame's tracks, don't extrapolate blindly
+SYNC_MAX_EXTRAPOLATION_S = 0.25  # default |dt| beyond which the whole frame's tracks are dropped rather than extrapolated
+                                 # blindly; fusion passes its own (wider) window once it has measured the detector latency
 
 
-def sync_and_filter(tracks, dt):
+def sync_and_filter(tracks, dt, max_dt=SYNC_MAX_EXTRAPOLATION_S):
     """Extrapolate every track's EKF state by dt (the gap between the radar frame's own
     timestamp and the camera timestamp it's being matched against), then drop suspicious
     tracks. Returns shallow copies — never mutates the tracker's own Track objects, so the
     live Tracker keeps coasting/confirming them normally regardless of what fusion accepts."""
-    if abs(dt) > SYNC_MAX_EXTRAPOLATION_S:
+    if abs(dt) > max_dt:
         return []
     out = []
     for tr in tracks:

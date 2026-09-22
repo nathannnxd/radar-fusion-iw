@@ -57,6 +57,16 @@ USE_NCNN = code_config.get("USE_NCNN", 0)    # 1 — export/run YOLO via the NCN
                                              # once, to fetch the pnnx converter); later runs load the cached export.
 YOLO_IMGSZ = code_config.get("YOLO_IMGSZ", 640)   # inference resolution passed to model.track(); an int (square) or
                                                   # [h, w] (each must be a multiple of 32) — e.g. [320, 416] on a Pi
+YOLO_EVERY_N = max(1, int(code_config.get("YOLO_EVERY_N", 1)))  # run YOLO on every N-th camera frame only; in between
+                                                  # the last boxes are reused (ByteTrack keeps its ids across calls). On a
+                                                  # Pi 4 N=2 roughly doubles the loop/display rate at the same detection rate
+CAM_WIDTH = int(code_config.get("CAM_WIDTH", 640))       # capture size requested from the camera (it may pick the nearest)
+CAM_HEIGHT = int(code_config.get("CAM_HEIGHT", 480))
+CAM_MJPG = int(code_config.get("CAM_MJPG", 0))           # 1 — ask the webcam for MJPG: many USB cams only give 30 fps in MJPG
+_ds = float(code_config.get("DISPLAY_SCALE", 1.0))
+DISPLAY_SCALE = 1.0 if _ds <= 0 else min(1.0, max(0.1, _ds))  # shrink BOTH on-screen windows (fewer pixels for VNC);
+                                                  # <= 0 means off, never upscale. Overlay text is tuned for a 640-wide
+                                                  # frame: keep CAM_WIDTH >= 640, shrink with DISPLAY_SCALE instead
 YOLO_WEIGHTS = {"yolov8n": "yolov8n.pt", "yolo-world": "yolov8s-worldv2.pt"}
 YOLO_CONF = 0.4
 #YOLO_KEEP = {0: ("person", 1.70), 1: ("bicycle", 1.10), 2: ("car", 1.50), 3: ("motorcycle", 1.20),
@@ -74,7 +84,9 @@ CAM_YAW_DEG = 0.0                    # yaw = radar_azimuth − camera_azimuth fo
                                      # positive if the radar axis is rotated LEFT of the camera axis. Refined by calibration.
 RADAR_TO_CAMERA_M = {"right": 0.0,\
                      "up": 0.0, "forward": 0.0}   # where the radar is relative to the lens; read from meta.json
-MAX_DT_S = 0.15                      # allowed desync between camera and radar frames
+MAX_DT_S = 0.15                      # allowed desync between camera and radar frames (camera newer than radar: this;
+                                     # camera older: this + measured YOLO latency + camera period, see Fusion.sync_window)
+SYNC_HARD_CAP_S = 0.6                # never match a camera frame older than this, however slow the detector is
 AZ_SIGMA_DEG = 4.0                   # expected azimuth error between sensors
 RANGE_REL_SIGMA = 0.35               # relative range error from bbox height (±35 %)
 CLIPPED_RANGE_SIGMA = 1.2            # ...if the bbox hits the frame edge — height is clipped, range is only an upper bound
@@ -90,6 +102,12 @@ RADAR_DOT_SUPPRESS_MARGIN_PX = 40    # a "radar only" dot within this many px (h
 SHOW_ONLY_INTERESTING = True
 MOVING_MPS = 0.25
 RADAR_STALE_S = 0.5                  # radar hasn't updated for this long — consider it lost (banner, tracks not drawn)
+CORRIDOR_HALF_WIDTH_M = 1.5          # while the carrier moves, a stationary object inside this lateral band ahead is an
+CORRIDOR_AHEAD_M = 20.0              # obstacle in the path (post, parked machine), not background — shown and alerted
+EGO_SERIAL_PORT = code_config.get("EGO_SERIAL_PORT", "")   # $RDEGO source (ESP32 with BNO085/GNSS); "" = radar-only ego,
+                                                            # "same" = the alert node's port (one USB cable both ways)
+EGO_BAUD = code_config.get("EGO_BAUD", 115200)
+EGO_STALE_S = 1.0                    # no $RDEGO for this long — fall back to the radar's own estimate
 CSV_FOLDER = "logs"
 CSV_PATH = os.path.join(CSV_FOLDER, f"fusion_{datetime.now():%Y%m%d_%H%M%S}.csv")
 SHOW_WINDOW = True
@@ -265,18 +283,40 @@ class Fusion:
             self.writer.writerow(["t", "radar_frame", "radar_id", "range_m", "range_near_m", "azimuth_deg", "radial_mps",
                                   "snr_db", "n_points", "radar_kind", "cam_id", "cam_class", "cam_conf",
                                   "cam_az_deg", "cam_range_est_m", "cam_clipped", "dt_s", "hits", "state", "fused_class",
-                                  "lost_reason", "absorbed_by"])
+                                  "lost_reason", "absorbed_by", "ego_mps", "abs_radial_mps"])
         self.last_fused = []
+        self.ego = {"v": 0.0, "valid": False, "moving": False}   # carrier motion for the current radar frame (set by the caller)
+        self.cam_lag = None        # EMA of (publish time - capture time) = detector latency, measured
+        self.cam_period = None     # EMA of the gap between camera observations
 
-    def push_camera(self, t, dets, frame=None):
+    def push_camera(self, t, dets, frame=None, t_pub=None):
+        """t — capture time of the frame; t_pub — the moment the detections are ready (after YOLO). The camera
+        observation only becomes visible to the radar thread now, i.e. (t_pub - t) later than it was taken —
+        on a Pi that is ~100-150 ms, more than MAX_DT_S, so the match window must expect the camera to lag."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if (frame is not None and cv2 is not None) else None
         with self.lock:
+            if t_pub is not None:
+                lag = max(0.0, t_pub - t)
+                self.cam_lag = lag if self.cam_lag is None else 0.8 * self.cam_lag + 0.2 * lag
+            if self.cam_buf:
+                gap = t - self.cam_buf[-1][0]
+                if 0 < gap < 2.0:
+                    self.cam_period = gap if self.cam_period is None else 0.8 * self.cam_period + 0.2 * gap
             self.cam_buf.append((t, dets, gray))
+
+    def sync_window(self):
+        """How much older than the radar frame a camera observation may be and still count as simultaneous:
+        the base budget + the detector latency + one camera period (the newest observation is at most that old)."""
+        return min(SYNC_HARD_CAP_S, MAX_DT_S + (self.cam_lag or 0.0) + (self.cam_period or 0.0))
 
     def nearest_camera_t(self, t):
         with self.lock:
             best = min(self.cam_buf, key=lambda it: abs(it[0] - t), default=None)
-        return best if best is not None and abs(best[0] - t) <= MAX_DT_S else None
+            late = self.sync_window()
+        if best is None:
+            return None
+        d = best[0] - t                                   # < 0: the camera observation is older than the radar frame
+        return best if -late <= d <= MAX_DT_S else None
 
     def _nearest_camera(self, t):
         best = self.nearest_camera_t(t)
@@ -401,6 +441,9 @@ class Fusion:
                 "cam_id": (d.cam_id if d is not None else m.cam_id) if confirmed else None,
                 "fused_class": m.cls if confirmed else ("radar-only" if d is None else "pairing"),
                 "hits": m.hits if m else 0, "matched_now": d is not None,
+                # relative (sensor-frame) values above are what collision logic needs; these two say what the object itself does
+                "ego_mps": self.ego["v"],
+                "abs_radial_mps": tr.radial_mps + self.ego["v"] * math.cos(math.atan2(float(tr.x[0]), float(tr.x[1]))),
                 "state": state, "bbox": bbox, "lost_reason": reason,
                 "hold_s": (t - m.last_cam_t) if state == "hold" else 0.0,
                 "absorbed_by": None, "x_m": float(tr.x[0]), "y_m": float(tr.x[1]),
@@ -431,7 +474,8 @@ class Fusion:
                                       round(self.cam.range_from_bbox(d.bh, d.obj_h_m), 2) if d else "",
                                       int(self.cam.bbox_clipped(d.x1, d.y1, d.x2, d.y2)) if d else "",
                                       round(dt, 3) if dt is not None else "", f["hits"], f["state"], f["fused_class"],
-                                      f["lost_reason"], f["absorbed_by"] if f["absorbed_by"] is not None else ""])
+                                      f["lost_reason"], f["absorbed_by"] if f["absorbed_by"] is not None else "",
+                                      round(f["ego_mps"], 2), round(f["abs_radial_mps"], 2)])
             for j, d in enumerate(cam_dets):
                 if j not in used_c:
                     self.writer.writerow([round(t, 3), radar_frame, "", "", "", "", "", "", "", "", d.cam_id, d.cls,
@@ -466,6 +510,12 @@ def load_detector(kind=DETECTOR):
         # NCNN export is validated here against yolov8n (the Pi-recommended detector); yolo-world's open-vocab
         # CLIP head may not export cleanly to NCNN via ultralytics — untested combination, use at your own risk
         ncnn_dir = os.path.splitext(weights)[0] + "_ncnn_model"
+        # a size-specific export (e.g. yolov8n_ncnn_model_256x320) wins when it matches YOLO_IMGSZ: NCNN exports are
+        # fixed-size, so lowering YOLO_IMGSZ in configs.json only speeds things up if a matching model dir exists
+        sz = YOLO_IMGSZ if isinstance(YOLO_IMGSZ, (list, tuple)) else [YOLO_IMGSZ, YOLO_IMGSZ]
+        sized_dir = f"{ncnn_dir}_{sz[0]}x{sz[1]}"
+        if os.path.isdir(sized_dir):
+            ncnn_dir = sized_dir
         if not os.path.isdir(ncnn_dir):
             print(f"Exporting {weights} to NCNN at imgsz={YOLO_IMGSZ} (needs internet the first time, to fetch the pnnx converter) ...")
             model.export(format="ncnn", imgsz=YOLO_IMGSZ)
@@ -579,7 +629,8 @@ def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, 
             continue
         u = int(cam.u_of_cam_azimuth(f["az_from_cam"])); v = int(cam.h / 2)
         if 0 <= u < cam.w:
-            if any(x1 - RADAR_DOT_SUPPRESS_MARGIN_PX <= u <= x2 + RADAR_DOT_SUPPRESS_MARGIN_PX for x1, x2 in object_x_spans):
+            margin = RADAR_DOT_SUPPRESS_MARGIN_PX * cam.w / 640.0          # the constant was tuned for a 640-wide frame
+            if any(x1 - margin <= u <= x2 + margin for x1, x2 in object_x_spans):
                 continue   # same horizontal area as an object already shown — same physical thing, not a new detection
             cv2.circle(img, (u, v), 9, (0, 0, 255), 2)
             _range_label(img, u + 12, v + 6, f"{r:.1f} m", (0, 0, 255), 0.6)
@@ -598,11 +649,97 @@ def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, 
     return img
 
 
-def interesting_ids(fused):
+def in_corridor(f):
+    """Object inside the band the carrier is about to drive through (sensor frame: x right, y forward)."""
+    az = math.radians(f["azimuth_deg"])
+    x, y = f["range_m"] * math.sin(az), f["range_m"] * math.cos(az)
+    return abs(x) <= CORRIDOR_HALF_WIDTH_M and 0 < y <= CORRIDOR_AHEAD_M
+
+
+def interesting_ids(fused, ego=None):
     if not SHOW_ONLY_INTERESTING:
         return None
+    moving = bool(ego and ego.get("moving"))
     return {f["radar_id"] for f in fused if f.get("absorbed_by") is None and
-            (f.get("state") in ("both", "hold") or abs(f["radial_mps"]) >= MOVING_MPS or f.get("speed_mps", 0) >= MOVING_MPS)}
+            (f.get("state") in ("both", "hold") or abs(f["radial_mps"]) >= MOVING_MPS or f.get("speed_mps", 0) >= MOVING_MPS
+             or (moving and in_corridor(f)))}      # a stationary post in the path is an obstacle once we move
+
+
+class EgoLink:
+    """Reads $RDEGO,<v_mps>,<yaw_dps>,<heading_deg>,<quality>*cs lines (NMEA-style XOR checksum, like $RDALT) from the
+    ESP32 carrying the BNO085 (+ GNSS later). Empty fields mean "unknown". speed() is None when unknown or stale so the
+    radar's own estimate takes over; yaw_rate() is 0 when unknown. Can share the alert node's serial object."""
+
+    def __init__(self, port, baud=115200, shared=None):
+        self.ser, self.t_rx, self.v, self.w, self.heading, self.quality = None, None, None, 0.0, None, 0
+        self.lock = threading.Lock()
+        self.buf = b""
+        if shared is not None:
+            self.ser = shared
+        elif port:
+            try:
+                import serial
+                self.ser = serial.Serial(port, baud, timeout=0)
+            except Exception as e:
+                print(f"warning: ego link {port} not opened ({e}) - using the radar's own speed estimate")
+        if self.ser is not None:
+            threading.Thread(target=self._reader, daemon=True).start()
+
+    @staticmethod
+    def _checksum_ok(line):
+        if not line.startswith("$") or "*" not in line:
+            return False
+        body, cs = line[1:].split("*", 1)
+        x = 0
+        for ch in body:
+            x ^= ord(ch)
+        try:
+            return x == int(cs[:2], 16)
+        except ValueError:
+            return False
+
+    def _reader(self):
+        while True:
+            try:
+                chunk = self.ser.read(256)
+            except Exception:
+                time.sleep(0.5); continue
+            if not chunk:
+                time.sleep(0.01); continue
+            self.buf += chunk
+            while b"\n" in self.buf:
+                raw, self.buf = self.buf.split(b"\n", 1)
+                line = raw.decode("ascii", errors="ignore").strip()
+                if not line.startswith("$RDEGO,") or not self._checksum_ok(line):
+                    continue
+                f = line[1:].split("*", 1)[0].split(",")
+                try:
+                    v = float(f[1]) if len(f) > 1 and f[1] else None
+                    w = math.radians(float(f[2])) if len(f) > 2 and f[2] else 0.0
+                    hd = float(f[3]) if len(f) > 3 and f[3] else None
+                    q = int(f[4]) if len(f) > 4 and f[4] else 0
+                except ValueError:
+                    continue
+                with self.lock:
+                    self.v, self.w, self.heading, self.quality, self.t_rx = v, w, hd, q, time.time()
+
+    def fresh(self):
+        return self.t_rx is not None and (time.time() - self.t_rx) <= EGO_STALE_S
+
+    def speed(self):
+        with self.lock:
+            return self.v if (self.fresh() and self.v is not None and self.quality > 0) else None
+
+    def yaw_rate(self):
+        with self.lock:
+            return self.w if self.fresh() else 0.0
+
+
+def display_scaled(img):
+    """Shrink a window image by DISPLAY_SCALE (display only — nothing maps window pixels back to frame pixels)."""
+    if DISPLAY_SCALE >= 1.0:
+        return img
+    return cv2.resize(img, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE, interpolation=cv2.INTER_AREA)
 
 
 # ---------------------------------------------------------------- live mode
@@ -624,7 +761,16 @@ def run_live(dump=None):
     cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_V4L2)
     if not cap.isOpened():
         raise SystemExit(f"camera {CAMERA_INDEX} did not open — check CAMERA_INDEX in configs.json (ls /dev/video*)")
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)        # newest frame, not a 3-4 frame old queue: the capture stamp below must be honest
+    if CAM_MJPG:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))   # before the size: V4L2 renegotiates the format
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH); cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
     w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fcc = int(cap.get(cv2.CAP_PROP_FOURCC)) & 0xFFFFFFFF
+    fcc_s = fcc.to_bytes(4, "little").decode("ascii", errors="replace").strip("\x00") or "?"
+    print(f"camera: {w}x{h} {fcc_s} @ {cap.get(cv2.CAP_PROP_FPS) or 0:.0f} fps nominal · YOLO every {YOLO_EVERY_N} frame(s)")
+    if CAM_MJPG and fcc_s != "MJPG":
+        print(f"warning: CAM_MJPG=1 but the camera negotiated {fcc_s} — no MJPG at {w}x{h} (v4l2-ctl --list-formats-ext)")
     cam = CameraModel(w, h)
     fus = Fusion(cam)
     yolo, keep = load_detector()
@@ -637,9 +783,14 @@ def run_live(dump=None):
         alert_engine = alerts.AlertEngine(sinks, resend_s=ALERT_RESEND_S, radar_only_confirm_s=RADAR_ONLY_CONFIRM_S,
                                           proximity_warn_m=PROXIMITY_WARN_M, proximity_critical_m=PROXIMITY_CRITICAL_M,
                                           closing_speed_mps=CLOSING_SPEED_ALERT_MPS)
+    shared = None
+    if EGO_SERIAL_PORT == "same" and alert_engine is not None:
+        shared = next((s.ser for s in sinks if getattr(s, "ser", None) is not None), None)
+    ego_link = EgoLink(None if EGO_SERIAL_PORT == "same" else EGO_SERIAL_PORT, EGO_BAUD, shared=shared)
     t_start = time.time()
     clock = lambda: time.time() - t_start
-    snap = {"t": -1e9, "fused": [], "dets": [], "matched": {}, "tracks": [], "rdets": [], "rkinds": [], "radar_fps": 0.0}
+    snap = {"t": -1e9, "fused": [], "dets": [], "matched": {}, "tracks": [], "rdets": [], "rkinds": [], "radar_fps": 0.0,
+            "ego": {"v": 0.0, "valid": False, "moving": False, "n_inliers": 0, "source": "-"}}
     state = {"snap": snap, "error": None}
     stop = threading.Event()
 
@@ -667,32 +818,46 @@ def run_live(dump=None):
                         while clock() < t_next:
                             time.sleep(0.005)
                     t_now = clock()
-                    out = pipe.process(fr)
+                    out = pipe.process(fr, ego_speed=ego_link.speed(), yaw_rate=ego_link.yaw_rate())
+                    fus.ego = out["ego"]
                     radar_fps.tick()
                     best = fus.nearest_camera_t(t_now)
                     dt_sync = (best[0] - t_now) if best is not None else 0.0
-                    filtered = radar_filter.sync_and_filter(out["tracks"], dt_sync)
+                    filtered = radar_filter.sync_and_filter(out["tracks"], dt_sync, max_dt=fus.sync_window())
                     fused, dets, matched = fus.on_radar(t_now, fr["frame"], filtered)
                     state["snap"] = {"t": t_now, "fused": fused, "dets": dets, "matched": matched,
                                      "tracks": filtered, "rdets": out["dets"], "rkinds": out["kinds"],
-                                     "radar_fps": radar_fps.fps}
+                                     "radar_fps": radar_fps.fps, "ego": out["ego"]}
         except BaseException as e:                               # a thread dying shouldn't be silent
             state["error"] = f"{type(e).__name__}: {e}"
             print("RADAR STOPPED:", state["error"], flush=True)
 
     threading.Thread(target=radar_thread, daemon=True).start()
     n = 0
-    fusion_fps = radar.FpsMeter()
+    dets = []                                                 # last YOLO result, reused on the frames YOLO skips
+    fusion_fps = radar.FpsMeter()                             # camera loop rate
+    det_fps = radar.FpsMeter()                                # YOLO rate (what actually limits detection latency)
+    t_report = 0.0
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
             t = clock()
-            dets = yolo_detections(yolo, frame, t, keep)
-            fus.push_camera(t, dets, frame)
+            if n % YOLO_EVERY_N == 0:
+                # detection frame: fresh boxes + the camera-side bookkeeping (frame quality, association history).
+                # Skipped frames deliberately don't call push_camera: the fusion then keeps matching the radar against
+                # the last *real* camera observation and its true timestamp instead of a re-stamped stale one.
+                dets = yolo_detections(yolo, frame, t, keep)
+                fus.push_camera(t, dets, frame, t_pub=clock())
+                det_fps.tick()
             n += 1
             fusion_fps.tick()
+            if t - t_report >= 5.0:                          # headless-friendly rate report (the windows show it too)
+                t_report = t
+                print(f"rate: loop {fusion_fps.fps:4.1f} fps · YOLO {det_fps.fps:4.1f}/s · radar {state['snap']['radar_fps']:4.1f} fps"
+                      f" · cam lag {(fus.cam_lag or 0) * 1000:3.0f} ms · sync window {fus.sync_window() * 1000:3.0f} ms"
+                      f" · {radar.ego_label(state['snap']['ego'])}", flush=True)
             if n % 50 == 0:
                 yaw = fus.apply_calibration()
                 if yaw is not None:
@@ -704,11 +869,11 @@ def run_live(dump=None):
             if SHOW_WINDOW:
                 img = draw_overlay(frame, s["fused"], dets, s["matched"], cam, s["tracks"], radar_stale=stale,
                                    fps=fusion_fps.fps if SHOW_FPS else None)
-                cv2.imshow("fusion", img)
-                cv2.imshow("radar", radar.render(s["rdets"], s["rkinds"], [] if stale else s["tracks"], pipe.bg,
-                                                 meters=radar.DRAW_METERS, only_ids=interesting_ids(s["fused"]),
+                cv2.imshow("fusion", display_scaled(img))
+                cv2.imshow("radar", display_scaled(radar.render(s["rdets"], s["rkinds"], [] if stale else s["tracks"], pipe.bg,
+                                                 meters=radar.DRAW_METERS, only_ids=interesting_ids(s["fused"], s["ego"]),
                                                  title="RADAR STALE" if stale else "",
-                                                 fps=s["radar_fps"] if SHOW_FPS else None))
+                                                 fps=s["radar_fps"] if SHOW_FPS else None, ego=s["ego"])))
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     break
     finally:

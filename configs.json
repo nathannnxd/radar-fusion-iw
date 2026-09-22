@@ -5,7 +5,15 @@
     "SHOW_FPS": 1,
     "USE_GPU": 0,
     "USE_NCNN": 1,
-    "YOLO_IMGSZ": [320, 416],
+    "YOLO_IMGSZ": [
+        256,
+        320
+    ],
+    "YOLO_EVERY_N": 2,
+    "CAM_WIDTH": 640,
+    "CAM_HEIGHT": 480,
+    "CAM_MJPG": 0,
+    "DISPLAY_SCALE": 1.0,
     "CAMERA_INDEX": 0,
     "RADAR_CONFIG": "radar_configs/config-16.09.26-12.43.cfg",
     "ALERTS_ENABLED": 1,
