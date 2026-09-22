@@ -183,3 +183,49 @@ reasonable starting point, not derived from real accelerometer noise data), whet
 axis really does read "right" on your specific mounting (confirm before trusting the sign, per the
 mounting-requirement note above), and whether 50 Hz over a plain wire at 115200 baud holds up next to
 the radar's own USB-serial traffic.
+
+## v2 sentence and ego-motion integration (branch `ego-motion`)
+
+Everything above still holds; this is what the ego-motion work (`EGO_MOTION.md`, the binding
+design contract) adds on top of it. The 5-field sentence and the `vx_mps`/`vy_mps`/`yaw_rate_dps`/
+`speed_mps` properties are unchanged and still work with a v1 firmware.
+
+**Sentence v2** (`EGO_MOTION.md` §2) — five fields appended, empty field = "unknown":
+
+```
+$EGOVEL,<vx_mps>,<vy_mps>,<yaw_rate_dps>,<seq>,<flags>,<esp_ms>,<pitch_deg>,<roll_deg>,<acc_fwd_mps2>,<gyro_cal>*<XOR>
+```
+
+`esp_ms` is the ESP32 `millis()` at the IMU sample (the Pi maps it onto its own clock with a running
+median offset over 2 s minus a 5 ms link-latency guess); `pitch_deg`/`roll_deg` come from the Game
+Rotation Vector (no magnetometer); `acc_fwd_mps2` is the bias-corrected forward acceleration the ZUPT
+already uses; `gyro_cal` is the BNO08x gyroscope accuracy status 0..3. The reader accepts 5 or 10
+fields and rejects any other count with a counted warning (`rejected_count`), never a misparse.
+
+**Firmware** — `firmware/ego_velocity/ego_velocity.ino` now also enables
+`SH2_GAME_ROTATION_VECTOR` at 50 Hz, derives pitch/roll from the quaternion (respecting
+`FORWARD_SIGN`/`RIGHT_SIGN`), emits the v2 sentence, and, behind `#define ALERT_NODE 1`, runs the
+`$RDALT` driver-alert node from `esp32/alert_node/alert_node.ino` on the USB `Serial` (same pins:
+LEDs 26/27/14, buzzer 25, link LED 2). One board: alerts in over USB, IMU out over `Serial2`. With
+`ALERT_NODE 1` the per-sample debug echo on `Serial` is compiled out.
+
+**Pi side** — `EgoVelocityReader` (`ego_velocity.py`) gained, per `EGO_MOTION.md` §5:
+
+- a 2-s ring buffer of samples on the Pi clock and `sample_at(t)` → `{yaw_rate (rad/s, + left,
+  bias-removed), pitch, roll, acc_fwd, vy_imu, zupt, gyro_ok, age_s}` linearly interpolated to
+  `t + EGO_TIME_OFFSET_S` — what `Pipeline.process(frame, imu=...)` consumes;
+- `gyro_ok = (gyro_cal ≥ 2, or unknown on v1) and age ≤ 0.2 s`;
+- gyro-bias removal with `EGO_GYRO_BIAS_DPS` (`configs.json`), refreshed at standstill via
+  `begin_standstill()` / `end_standstill()` (mean raw gyro Z while the window is open; the fusion
+  loop opens it after the radar has reported `STANDING` for 3 s and writes the result back to
+  `configs.json` on a clean exit);
+- `feed_line(line, t_rx)` for tests and offline replay, `clock=` to stamp samples with the caller's
+  time base, `version`, `rejected_count`, `clock_offset_s`.
+
+Speed policy reminder (`EGO_MOTION.md` §1): the radar Doppler fit is the operational carrier speed;
+`vy_mps` (integrated, ZUPT-bounded) is a bridge while the radar state is UNKNOWN and a STANDING
+input via its ZUPT flag — it is no longer what `Pipeline.ego` gets in the fusion loop.
+`Track.ground_velocity()` is fed with the radar fit (`ego_info["v"]` + the fit's lateral component).
+
+Tests: `python -m pytest -q tests/test_egolink.py` (v1/v2 parsing, checksum, seq drops,
+interpolation, clock offset, time offset, bias removal, staleness, standstill refresh — no hardware).

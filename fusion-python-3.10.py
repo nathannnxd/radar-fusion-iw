@@ -103,12 +103,19 @@ RADAR_DOT_SUPPRESS_MARGIN_PX = 40    # a "radar only" dot within this many px (h
 SHOW_ONLY_INTERESTING = True
 MOVING_MPS = 0.25
 RADAR_STALE_S = 0.5                  # radar hasn't updated for this long — consider it lost (banner, tracks not drawn)
-CORRIDOR_HALF_WIDTH_M = 1.5          # while the carrier moves, a stationary object inside this lateral band ahead is an
-CORRIDOR_AHEAD_M = 20.0              # obstacle in the path (post, parked machine), not background — shown and alerted
-EGO_SERIAL_PORT = code_config.get("EGO_SERIAL_PORT", "")   # $RDEGO source (ESP32 with BNO085/GNSS); "" = radar-only ego,
-                                                            # "same" = the alert node's port (one USB cable both ways)
+CORRIDOR_HALF_WIDTH_M = float(code_config.get("CORRIDOR_HALF_WIDTH_M", 1.5))   # driving corridor half-width: track +
+                                     # implement/2 + 0.3 m margin — a stationary object inside it ahead is an obstacle
+                                     # in the path (post, parked machine), never background — EGO_MOTION.md §5
+CORRIDOR_MIN_AHEAD_M = 6.0           # corridor look-ahead = max(this, v * TTC_WARN_S * CORRIDOR_AHEAD_TTC_FACTOR) — §5
+CORRIDOR_AHEAD_TTC_FACTOR = 1.3      # ... i.e. a bit beyond the distance covered in one warning-TTC — §5
+CORRIDOR_BEND_MIN_MPS = 0.7          # below this speed the corridor is a straight box (kappa = w/v blows up) — §5
+OBSTACLE_PERSIST_FRAMES = radar.BACKGROUND_PERSIST_FRAMES   # a static return in the corridor is an obstacle after this
+                                     # many frames — the same §5 threshold the BackgroundMap confirms a cell with
+EGO_SERIAL_PORT = code_config.get("EGO_SERIAL_PORT", "")   # ESP32+BNO08x $EGOVEL link (ego_velocity.py, EGO_VELOCITY.md,
+                                                            # EGO_MOTION.md §1: Serial2 -> Pi GPIO UART); "" = radar-only ego
 EGO_BAUD = code_config.get("EGO_BAUD", 115200)
-EGO_STALE_S = 1.0                    # no $RDEGO for this long — fall back to the radar's own estimate
+EGO_BIAS_STANDSTILL_S = 3.0          # radar STANDING held this long -> refresh the gyro bias (EGO_GYRO_BIAS_DPS) — §5
+CONFIG_PATH = "configs.json"         # EGO_GYRO_BIAS_DPS is written back here on a clean exit (that key only) — §3
 CSV_FOLDER = "logs"
 CSV_PATH = os.path.join(CSV_FOLDER, f"fusion_{datetime.now():%Y%m%d_%H%M%S}.csv")
 SHOW_WINDOW = True
@@ -120,6 +127,8 @@ ALERT_BAUD = code_config.get("ALERT_BAUD", 115200)
 PROXIMITY_WARN_M = code_config.get("PROXIMITY_WARN_M", 3.0)          # object closer than this — PROXIMITY_WARNING
 PROXIMITY_CRITICAL_M = code_config.get("PROXIMITY_CRITICAL_M", 1.5)  # ...and this — PROXIMITY_CRITICAL
 CLOSING_SPEED_ALERT_MPS = code_config.get("CLOSING_SPEED_ALERT_MPS", 2.0)  # FAST_APPROACH threshold
+TTC_WARN_S = float(code_config.get("TTC_WARN_S", alerts.TTC_WARN_S))            # time-to-collision tiers — TTC_WARNING /
+TTC_CRITICAL_S = float(code_config.get("TTC_CRITICAL_S", alerts.TTC_CRITICAL_S))  # TTC_CRITICAL (EGO_MOTION.md §5, ALERTS.md)
 RADAR_ONLY_CONFIRM_S = code_config.get("RADAR_ONLY_CONFIRM_S", 1.0)  # radar-only object must persist this long before alerting (avoids alerting on a single-frame clutter blip)
 ALERT_RESEND_S = code_config.get("ALERT_RESEND_S", 2.0)              # heartbeat interval for an alert that's still active
 
@@ -285,9 +294,10 @@ class Fusion:
             self.writer.writerow(["t", "radar_frame", "radar_id", "range_m", "range_near_m", "azimuth_deg", "radial_mps",
                                   "snr_db", "n_points", "radar_kind", "cam_id", "cam_class", "cam_conf",
                                   "cam_az_deg", "cam_range_est_m", "cam_clipped", "dt_s", "hits", "state", "fused_class",
-                                  "lost_reason", "absorbed_by", "ego_mps", "abs_radial_mps"])
+                                  "lost_reason", "absorbed_by", "ego_mps", "abs_radial_mps", "in_corridor", "obstacle"])
         self.last_fused = []
         self.ego = {"v": 0.0, "valid": False, "moving": False}   # carrier motion for the current radar frame (set by the caller)
+        self.corridor_hits: dict[int, int] = {}   # radar_id -> consecutive frames inside the corridor (obstacle persistence)
         self.cam_lag = None        # EMA of (publish time - capture time) = detector latency, measured
         self.cam_period = None     # EMA of the gap between camera observations
 
@@ -353,7 +363,11 @@ class Fusion:
         # the box doesn't extend past the frame: what's beyond the edge the camera wouldn't show anyway
         return (int(max(0, cu - bw / 2)), int(max(0, ny1)), int(min(self.cam.w - 1, cu + bw / 2)), int(min(self.cam.h - 1, ny2)))
 
-    def on_radar(self, t, radar_frame, tracks, ego_vx_mps=0.0, ego_vy_mps=0.0):
+    def on_radar(self, t, radar_frame, tracks, ego_vx_mps=0.0, ego_vy_mps=0.0, rdets=None):
+        """ego_vx_mps / ego_vy_mps — the carrier's lateral / forward speed for Track.ground_velocity() (from the radar
+        Doppler fit, EGO_MOTION.md §5 — never the IMU's integrated velocity); rdets — the frame's radar point
+        detections (out["dets"]) so a point's "persist" count (BackgroundMap persistence evidence) can back the
+        corridor-obstacle decision; None = per-track frame counting only."""
         cam_dets, dt, gray = self._nearest_camera(t)
         cam_dets = cam_dets or []
         cam_view = [self.cam.cam_view(float(tr.x[0]), float(tr.x[1])) for tr in tracks]   # (az_from_cam, depth)
@@ -454,6 +468,9 @@ class Fusion:
                 "abs_radial_mps": tr.radial_mps + self.ego["v"] * math.cos(math.atan2(float(tr.x[0]), float(tr.x[1]))),
                 "state": state, "bbox": bbox, "lost_reason": reason,
                 "hold_s": (t - m.last_cam_t) if state == "hold" else 0.0,
+                # cluster-level static/moving verdict (EGO_MOTION.md §5: median compensated Doppler of >= 3 points
+                # against 0.8*bin) — steadier than any single point's +-half-bin quantisation; None = too few points
+                "is_static": tr.is_static,
                 "absorbed_by": None, "x_m": float(tr.x[0]), "y_m": float(tr.x[1]),
             })
 
@@ -470,6 +487,27 @@ class Fusion:
                     a["range_near_m"] = min(a["range_near_m"], f["range_near_m"])
                     break
 
+        # 4b) driving corridor (EGO_MOTION.md §5): anything inside it — a stationary post included — is an obstacle
+        # once it has persisted OBSTACLE_PERSIST_FRAMES frames (own frame count, or the radar points' BackgroundMap
+        # "persist" evidence when the pipeline provides it) or the camera has confirmed it. Never a background drop.
+        seen = set()
+        for f in fused:
+            inside = f["absorbed_by"] is None and in_corridor(f, self.ego)
+            f["in_corridor"] = inside
+            if inside:
+                seen.add(f["radar_id"])
+                self.corridor_hits[f["radar_id"]] = self.corridor_hits.get(f["radar_id"], 0) + 1
+            persist = self.corridor_hits.get(f["radar_id"], 0) if inside else 0
+            if inside and rdets:
+                near = [d.get("persist", 0) for d in rdets
+                        if math.hypot(d["x_m"] - f["x_m"], d["y_m"] - f["y_m"]) < MERGE_DIST_M]
+                persist = max([persist] + near)
+            f["persist"] = persist
+            f["obstacle"] = inside and (persist >= OBSTACLE_PERSIST_FRAMES or f["state"] in ("both", "hold"))
+        for rid in list(self.corridor_hits):
+            if rid not in seen:
+                del self.corridor_hits[rid]
+
         # 5) CSV
         if self.writer:
             for i, tr in enumerate(tracks):
@@ -483,14 +521,15 @@ class Fusion:
                                       int(self.cam.bbox_clipped(d.x1, d.y1, d.x2, d.y2)) if d else "",
                                       round(dt, 3) if dt is not None else "", f["hits"], f["state"], f["fused_class"],
                                       f["lost_reason"], f["absorbed_by"] if f["absorbed_by"] is not None else "",
-                                      round(f["ego_mps"], 2), round(f["abs_radial_mps"], 2)])
+                                      round(f["ego_mps"], 2), round(f["abs_radial_mps"], 2),
+                                      int(f["in_corridor"]), int(f["obstacle"])])
             for j, d in enumerate(cam_dets):
                 if j not in used_c:
                     self.writer.writerow([round(t, 3), radar_frame, "", "", "", "", "", "", "", "", d.cam_id, d.cls,
                                           round(d.conf, 2), round(self.cam.azimuth_of_u(d.cx), 1),
                                           round(self.cam.range_from_bbox(d.bh, d.obj_h_m), 2),
                                           int(self.cam.bbox_clipped(d.x1, d.y1, d.x2, d.y2)),
-                                          round(dt, 3) if dt is not None else "", 0, "cam-only", "cam-only", "", ""])
+                                          round(dt, 3) if dt is not None else "", 0, "cam-only", "cam-only", "", "", "", "", "", ""])
         self.last_fused = fused
         return fused, cam_dets, matched
 
@@ -572,14 +611,25 @@ def _dashed_rect(img, p1, p2, color, thick=2, dash=12):
 
 
 def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, radar_stale=False, fps=None,
-                 ego_speed_mps=None, ego_yaw_rate_dps=None):
+                 ego_speed_mps=None, ego_yaw_rate_dps=None, ego=None):
     """Green box — both sensors; cyan — camera lost it, radar is tracking (dashed — radar on prediction);
     thin orange — camera only (range from bbox height, "≤" if the box is clipped by the edge);
-    red circle — moving radar with no pair. The number on the box is the range to the nearest point (radar)."""
+    red circle — moving radar with no pair. The number on the box is the range to the nearest point (radar).
+    ego — the pipeline's carrier-motion dict (out["ego"]): shown as state / v / yaw / gyro in the corner and
+    takes precedence over the plain ego_speed_mps / ego_yaw_rate_dps readout (kept for older callers)."""
     img = frame.copy()
     if fps is not None:
         _range_label(img, cam.w - 130, 26, f"{fps:4.1f} fps", (200, 200, 200), 0.55)
-    if ego_speed_mps is not None:
+    if ego:
+        if ego_speed_mps is None and ego.get("valid"):
+            ego_speed_mps = ego.get("v", 0.0)
+        state = alerts.ego_state(ego)
+        yaw_dps = math.degrees(ego.get("yaw_rate", 0.0) or 0.0)
+        gyro = ego.get("gyro_ok")
+        ego_txt = f"ego {state} {ego.get('v', 0.0):+4.1f} m/s  yaw {yaw_dps:+5.1f}°/s  gyro {'ok' if gyro else 'NO' if gyro is False else '-'}"
+        col = (0, 60, 255) if (state == "UNKNOWN" or gyro is False) else (180, 220, 180)
+        _range_label(img, cam.w - 330, 52, ego_txt, col, 0.5)
+    elif ego_speed_mps is not None:
         ego_txt = f"ego {ego_speed_mps:+4.1f} m/s"
         if ego_yaw_rate_dps is not None:
             ego_txt += f"  yaw {ego_yaw_rate_dps:+5.1f}°/s"
@@ -641,7 +691,8 @@ def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, 
             continue
         if st == "out-of-frame":
             continue
-        if SHOW_ONLY_INTERESTING and abs(vr) < MOVING_MPS and f.get("speed_mps", 0) < MOVING_MPS:
+        obstacle = bool(f.get("obstacle"))                            # static thing in the driving corridor: always shown
+        if SHOW_ONLY_INTERESTING and not obstacle and abs(vr) < MOVING_MPS and f.get("speed_mps", 0) < MOVING_MPS:
             continue
         u = int(cam.u_of_cam_azimuth(f["az_from_cam"])); v = int(cam.h / 2)
         if 0 <= u < cam.w:
@@ -650,7 +701,8 @@ def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, 
                 continue   # same horizontal area as an object already shown — same physical thing, not a new detection
             cv2.circle(img, (u, v), 9, (0, 0, 255), 2)
             _range_label(img, u + 12, v + 6, f"{r:.1f} m", (0, 0, 255), 0.6)
-            cv2.putText(img, f"radar only {vr:+.1f} m/s", (u + 12, v + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+            cv2.putText(img, ("OBSTACLE " if obstacle else "radar only ") + f"{vr:+.1f} m/s", (u + 12, v + 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
             if nearest is None or r < nearest[0]:
                 nearest = (r, vr, "radar")
     if nearest is not None and not radar_stale:
@@ -665,11 +717,30 @@ def draw_overlay(frame, fused, cam_dets, matched_idx, cam: CameraModel, tracks, 
     return img
 
 
-def in_corridor(f):
-    """Object inside the band the carrier is about to drive through (sensor frame: x right, y forward)."""
-    az = math.radians(f["azimuth_deg"])
-    x, y = f["range_m"] * math.sin(az), f["range_m"] * math.cos(az)
-    return abs(x) <= CORRIDOR_HALF_WIDTH_M and 0 < y <= CORRIDOR_AHEAD_M
+def corridor_geometry(ego=None):
+    """(look-ahead m, curvature 1/m) of the driving corridor for the carrier state (EGO_MOTION.md §5): look-ahead
+    max(CORRIDOR_MIN_AHEAD_M, v * TTC_WARN_S * 1.3); when v >= CORRIDOR_BEND_MIN_MPS the corridor bends with
+    kappa = w / v (w = gyro yaw rate, + = left), otherwise it is a straight box."""
+    v = float(ego.get("v", 0.0)) if ego else 0.0
+    w = float(ego.get("yaw_rate", 0.0) or 0.0) if ego else 0.0
+    ahead = max(CORRIDOR_MIN_AHEAD_M, abs(v) * TTC_WARN_S * CORRIDOR_AHEAD_TTC_FACTOR)
+    kappa = (w / v) if v >= CORRIDOR_BEND_MIN_MPS else 0.0
+    return ahead, kappa
+
+
+def in_corridor(f, ego=None):
+    """Object inside the band the carrier is about to drive through (sensor frame: x right, y forward). With the
+    carrier state the band follows the predicted path: the centre line is offset laterally by ≈ kappa*y²/2 — to the
+    left (−x) for a left turn (kappa > 0), see corridor_geometry()."""
+    if "x_m" in f and "y_m" in f:
+        x, y = f["x_m"], f["y_m"]
+    else:
+        az = math.radians(f["azimuth_deg"])
+        x, y = f["range_m"] * math.sin(az), f["range_m"] * math.cos(az)
+    ahead, kappa = corridor_geometry(ego)
+    if not 0 < y <= ahead:
+        return False
+    return abs(x + kappa * y * y / 2.0) <= CORRIDOR_HALF_WIDTH_M
 
 
 def interesting_ids(fused, ego=None):
@@ -678,77 +749,41 @@ def interesting_ids(fused, ego=None):
     moving = bool(ego and ego.get("moving"))
     return {f["radar_id"] for f in fused if f.get("absorbed_by") is None and
             (f.get("state") in ("both", "hold") or abs(f["radial_mps"]) >= MOVING_MPS or f.get("speed_mps", 0) >= MOVING_MPS
-             or (moving and in_corridor(f)))}      # a stationary post in the path is an obstacle once we move
+             or f.get("obstacle") or (moving and in_corridor(f, ego)))}   # a stationary post in the path is an obstacle once we move
 
 
-class EgoLink:
-    """Reads $RDEGO,<v_mps>,<yaw_dps>,<heading_deg>,<quality>*cs lines (NMEA-style XOR checksum, like $RDALT) from the
-    ESP32 carrying the BNO085 (+ GNSS later). Empty fields mean "unknown". speed() is None when unknown or stale so the
-    radar's own estimate takes over; yaw_rate() is 0 when unknown. Can share the alert node's serial object."""
-
-    def __init__(self, port, baud=115200, shared=None):
-        self.ser, self.t_rx, self.v, self.w, self.heading, self.quality = None, None, None, 0.0, None, 0
-        self.lock = threading.Lock()
-        self.buf = b""
-        if shared is not None:
-            self.ser = shared
-        elif port:
-            try:
-                import serial
-                self.ser = serial.Serial(port, baud, timeout=0)
-            except Exception as e:
-                print(f"warning: ego link {port} not opened ({e}) - using the radar's own speed estimate")
-        if self.ser is not None:
-            threading.Thread(target=self._reader, daemon=True).start()
-
-    @staticmethod
-    def _checksum_ok(line):
-        if not line.startswith("$") or "*" not in line:
+def save_gyro_bias(bias_dps, path=CONFIG_PATH):
+    """Persist EGO_GYRO_BIAS_DPS (EGO_MOTION.md §3) into configs.json by rewriting that one key in place — the file's
+    layout, key order and line endings (CRLF on the Windows checkout) are left exactly as they were; a missing key
+    is appended before the closing brace with the same indentation as its neighbours."""
+    import re
+    try:
+        raw = open(path, "rb").read().decode("utf-8")
+    except OSError as e:
+        print(f"warning: {path} not rewritten ({e}) — EGO_GYRO_BIAS_DPS {bias_dps:+.4f} not persisted")
+        return False
+    nl = "\r\n" if "\r\n" in raw else "\n"
+    value = f"{bias_dps:.4f}"
+    new, n = re.subn(r'("EGO_GYRO_BIAS_DPS"\s*:\s*)-?[0-9.eE+-]+', lambda m: m.group(1) + value, raw, count=1)
+    if n == 0:
+        m = re.search(r'(\r?\n)([ \t]*)"[^"\r\n]+"\s*:', raw)               # indentation of the first key
+        indent = m.group(2) if m else "    "
+        end = raw.rstrip().rfind("}")
+        if end < 0:
+            print(f"warning: {path} is not a JSON object — EGO_GYRO_BIAS_DPS not persisted")
             return False
-        body, cs = line[1:].split("*", 1)
-        x = 0
-        for ch in body:
-            x ^= ord(ch)
-        try:
-            return x == int(cs[:2], 16)
-        except ValueError:
-            return False
-
-    def _reader(self):
-        while True:
-            try:
-                chunk = self.ser.read(256)
-            except Exception:
-                time.sleep(0.5); continue
-            if not chunk:
-                time.sleep(0.01); continue
-            self.buf += chunk
-            while b"\n" in self.buf:
-                raw, self.buf = self.buf.split(b"\n", 1)
-                line = raw.decode("ascii", errors="ignore").strip()
-                if not line.startswith("$RDEGO,") or not self._checksum_ok(line):
-                    continue
-                f = line[1:].split("*", 1)[0].split(",")
-                try:
-                    v = float(f[1]) if len(f) > 1 and f[1] else None
-                    w = math.radians(float(f[2])) if len(f) > 2 and f[2] else 0.0
-                    hd = float(f[3]) if len(f) > 3 and f[3] else None
-                    q = int(f[4]) if len(f) > 4 and f[4] else 0
-                except ValueError:
-                    continue
-                with self.lock:
-                    self.v, self.w, self.heading, self.quality, self.t_rx = v, w, hd, q, time.time()
-
-    def fresh(self):
-        return self.t_rx is not None and (time.time() - self.t_rx) <= EGO_STALE_S
-
-    def speed(self):
-        with self.lock:
-            return self.v if (self.fresh() and self.v is not None and self.quality > 0) else None
-
-    def yaw_rate(self):
-        with self.lock:
-            return self.w if self.fresh() else 0.0
+        head = raw[:end].rstrip()
+        if not head.endswith("{") and not head.endswith(","):
+            head += ","
+        new = head + nl + indent + f'"EGO_GYRO_BIAS_DPS": {value}' + nl + raw[end:]
+    try:
+        json.loads(new)                                                     # never leave a broken config behind
+    except ValueError as e:
+        print(f"warning: rewritten {path} would not parse ({e}) — EGO_GYRO_BIAS_DPS not persisted")
+        return False
+    open(path, "wb").write(new.encode("utf-8"))
+    print(f"configs.json: EGO_GYRO_BIAS_DPS = {value} deg/s (standstill refresh)")
+    return True
 
 
 def display_scaled(img):
@@ -798,23 +833,32 @@ def run_live(dump=None):
             sinks.append(alerts.SerialAlertSink(ALERT_SERIAL_PORT, ALERT_BAUD))
         alert_engine = alerts.AlertEngine(sinks, resend_s=ALERT_RESEND_S, radar_only_confirm_s=RADAR_ONLY_CONFIRM_S,
                                           proximity_warn_m=PROXIMITY_WARN_M, proximity_critical_m=PROXIMITY_CRITICAL_M,
-                                          closing_speed_mps=CLOSING_SPEED_ALERT_MPS)
-    shared = None
-    if EGO_SERIAL_PORT == "same" and alert_engine is not None:
-        shared = next((s.ser for s in sinks if getattr(s, "ser", None) is not None), None)
-    ego_link = EgoLink(None if EGO_SERIAL_PORT == "same" else EGO_SERIAL_PORT, EGO_BAUD, shared=shared)
+                                          closing_speed_mps=CLOSING_SPEED_ALERT_MPS,
+                                          ttc_warn_s=TTC_WARN_S, ttc_critical_s=TTC_CRITICAL_S,
+                                          imu_expected=bool(EGO_SERIAL_PORT))
     t_start = time.time()
     clock = lambda: time.time() - t_start
+    # the $EGOVEL link (ESP32 + BNO08x, EGO_VELOCITY.md); stamps its samples with the same zero-based clock the radar
+    # frames get below, so reader.sample_at(t_frame) lines the IMU up with the frame (EGO_MOTION.md §5)
+    ego_reader = ego_velocity.EgoVelocityReader(EGO_SERIAL_PORT, EGO_BAUD, clock=clock)
     snap = {"t": -1e9, "fused": [], "dets": [], "matched": {}, "tracks": [], "rdets": [], "rkinds": [], "radar_fps": 0.0,
-            "ego": {"v": 0.0, "vx": 0.0, "valid": False, "moving": False, "n_inliers": 0, "source": "-"}}
+            "ego": {"v": 0.0, "vx": 0.0, "raw": 0.0, "valid": False, "moving": False, "n_inliers": 0, "source": "-",
+                    "state": "UNKNOWN", "yaw_rate": 0.0, "gyro_ok": None, "imu_seen": False, "ttc_bound": False},
+            "imu": dict(ego_velocity.EGO_IMU_NONE)}
     state = {"snap": snap, "error": None}
     stop = threading.Event()
+
+    def process_frame(fr, imu):
+        """pipe.process with the interpolated IMU sample: the estimator takes the whole dict (yaw_rate, pitch/roll,
+        zupt, gyro_ok, age_s) and picks what it trusts — EGO_MOTION.md §4."""
+        return pipe.process(fr, imu=imu)
 
     def radar_thread():
         try:
             buffer = b""
             period = cfg.get("frame_period_s") or 0.1
             t_next = None
+            standing_since = None                                     # radar STANDING since (gyro-bias refresh, §5)
             radar_fps = radar.FpsMeter()
             for chunk in radar.byte_source():
                 if stop.is_set():
@@ -834,17 +878,33 @@ def run_live(dump=None):
                         while clock() < t_next:
                             time.sleep(0.005)
                     t_now = clock()
-                    out = pipe.process(fr, ego_speed=ego_link.speed(), yaw_rate=ego_link.yaw_rate())
+                    imu = ego_reader.sample_at(t_now)                 # IMU state at the frame time (+ EGO_TIME_OFFSET_S)
+                    out = process_frame(fr, imu)
                     fus.ego = out["ego"]
                     radar_fps.tick()
+                    # standstill gyro-bias refresh (EGO_MOTION.md §5): the radar says STANDING for EGO_BIAS_STANDSTILL_S
+                    # and the IMU's own ZUPT agrees (or the link is down, then there is nothing to average anyway)
+                    # -> average the raw gyro Z until the carrier moves again; the reader applies the new bias itself
+                    standing = alerts.ego_state(out["ego"]) == "STANDING" and (imu["zupt"] or not imu["gyro_ok"])
+                    if standing:
+                        standing_since = t_now if standing_since is None else standing_since
+                        if t_now - standing_since >= EGO_BIAS_STANDSTILL_S and not ego_reader.standstill_open:
+                            ego_reader.begin_standstill()
+                    else:
+                        standing_since = None
+                        if ego_reader.standstill_open:
+                            print(f"gyro bias refreshed at standstill: {ego_reader.end_standstill():+.3f} deg/s", flush=True)
                     best = fus.nearest_camera_t(t_now)
                     dt_sync = (best[0] - t_now) if best is not None else 0.0
                     filtered = radar_filter.sync_and_filter(out["tracks"], dt_sync, max_dt=fus.sync_window())
+                    # ground velocities from the radar Doppler fit (v + the fit's lateral component) — never from the
+                    # IMU's integrated velocity, which is only a bridge inside the estimator (EGO_MOTION.md §1, §5)
                     fused, dets, matched = fus.on_radar(t_now, fr["frame"], filtered,
-                                                        ego_vx_mps=out["ego"].get("vx", 0.0), ego_vy_mps=out["ego"]["v"])
+                                                        ego_vx_mps=out["ego"].get("vx", 0.0), ego_vy_mps=out["ego"]["v"],
+                                                        rdets=out["dets"])
                     state["snap"] = {"t": t_now, "fused": fused, "dets": dets, "matched": matched,
                                      "tracks": filtered, "rdets": out["dets"], "rkinds": out["kinds"],
-                                     "radar_fps": radar_fps.fps, "ego": out["ego"]}
+                                     "radar_fps": radar_fps.fps, "ego": out["ego"], "imu": imu}
         except BaseException as e:                               # a thread dying shouldn't be silent
             state["error"] = f"{type(e).__name__}: {e}"
             print("RADAR STOPPED:", state["error"], flush=True)
@@ -874,7 +934,10 @@ def run_live(dump=None):
                 t_report = t
                 print(f"rate: loop {fusion_fps.fps:4.1f} fps · YOLO {det_fps.fps:4.1f}/s · radar {state['snap']['radar_fps']:4.1f} fps"
                       f" · cam lag {(fus.cam_lag or 0) * 1000:3.0f} ms · sync window {fus.sync_window() * 1000:3.0f} ms"
-                      f" · {radar.ego_label(state['snap']['ego'])}", flush=True)
+                      f" · {radar.ego_label(state['snap']['ego'])}"
+                      + (f" · IMU v{ego_reader.version} age {state['snap']['imu']['age_s'] * 1000:3.0f} ms"
+                         f" gyro {'ok' if state['snap']['imu']['gyro_ok'] else 'NO'} bias {ego_reader.gyro_bias_dps:+.2f}°/s"
+                         f" drops {ego_reader.dropped_count}" if EGO_SERIAL_PORT else ""), flush=True)
             if n % 50 == 0:
                 yaw = fus.apply_calibration()
                 if yaw is not None:
@@ -882,12 +945,13 @@ def run_live(dump=None):
             s = state["snap"]
             stale = (t - s["t"]) > RADAR_STALE_S or state["error"] is not None
             if alert_engine is not None:
-                alert_engine.evaluate(t, s["fused"], dets, cam, stale)
+                alert_engine.evaluate(t, s["fused"], dets, cam, stale, ego=s["ego"])
             if SHOW_WINDOW:
                 img = draw_overlay(frame, s["fused"], dets, s["matched"], cam, s["tracks"], radar_stale=stale,
                                    fps=fusion_fps.fps if SHOW_FPS else None,
                                    ego_speed_mps=s["ego"]["v"] if s["ego"].get("valid") else None,
-                                   ego_yaw_rate_dps=math.degrees(s["ego"].get("yaw_rate", 0.0)) if s["ego"].get("valid") else None)
+                                   ego_yaw_rate_dps=math.degrees(s["ego"].get("yaw_rate", 0.0)) if s["ego"].get("valid") else None,
+                                   ego=s["ego"])
                 cv2.imshow("fusion", display_scaled(img))
                 cv2.imshow("radar", display_scaled(radar.render(s["rdets"], s["rkinds"], [] if stale else s["tracks"], pipe.bg,
                                                  meters=radar.DRAW_METERS, only_ids=interesting_ids(s["fused"], s["ego"]),
@@ -899,6 +963,11 @@ def run_live(dump=None):
         stop.set(); cap.release(); fus.close()
         if alert_engine is not None:
             alert_engine.close()
+        if ego_reader.standstill_open:                       # quit while parked: take that window too
+            ego_reader.end_standstill()
+        ego_reader.close()
+        if ego_reader.bias_refreshed:                        # clean exit: keep the last standstill bias for the next run
+            save_gyro_bias(ego_reader.gyro_bias_dps)
         try:
             cv2.destroyAllWindows()
         except cv2.error:

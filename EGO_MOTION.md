@@ -50,7 +50,7 @@ rejected loudly. Checksum: XOR of the characters between `$` and `*`, two upperc
 | `LEVER_ARM_X_M` | radar phase centre forward of the rear-axle centre (yaw rotation point), m | tape measure |
 | `LEVER_ARM_Y_M` | radar left (+) of the vehicle centre line, m | tape measure (0 if on the centre line) |
 | `MOUNT_YAW_DEG` | radar boresight left (+) of the vehicle forward axis | straight drive fwd/back: the yaw angle that zeroes the lateral component of the fit (`calib_mount.py`) |
-| `EGO_TIME_OFFSET_S` | radar frame timestamp − IMU time for the same physical instant (negative: radar lags) | `calib_time_offset.py` on a step-turn recording (replay grid search primary, cross-correlation check); re-measure after a profile change |
+| `EGO_TIME_OFFSET_S` | **IMU time − radar frame timestamp** for the same physical instant — exactly the quantity `sample_at` adds to the frame time (negative: the radar's timestamp is the later one, i.e. the radar lags) | `calib_time_offset.py` on a step-turn recording (replay grid search primary, cross-correlation check); re-measure after a profile change |
 | `EGO_GYRO_BIAS_DPS` | last standstill gyro-bias estimate (auto-refreshed at every STANDING episode ≥ 3 s, persisted) | automatic |
 
 ## 4. Estimator (`iwr1642_live.EgoEstimator`)
@@ -60,10 +60,12 @@ Inputs per frame: raw detections (range, azimuth, doppler, snr), `dt`, profile n
 and the IMU sample interpolated to the frame time (`t_frame + EGO_TIME_OFFSET_S`): `yaw_rate`
 (bias-removed, rad/s), `pitch`, `roll`, `gyro_ok`.
 
-Model for a stationary point i at azimuth θ_i (sensor frame, boresight = +y as in the code):
-`doppler_i = -(v_sx·cos θ_i + v_sy·sin θ_i)` where the sensor-frame velocity is
-`v_sx = v − ω·LEVER_ARM_Y_M` (forward), `v_sy = ω·LEVER_ARM_X_M` (lateral, left +). Rotate azimuths by
-`MOUNT_YAW_DEG` first.
+Model for a stationary point i at azimuth θ_i. **One frame throughout: sensor frame x = right, y = forward =
+boresight, θ = atan2(x, y) so θ is RIGHT-positive, ω is + for a left turn (CCW from above).**
+`doppler_i = -(v_fwd·cos θ_i + v_lat·sin θ_i)` (TI convention: + = receding) where the radar's own velocity is
+`v_fwd = v − ω·LEVER_ARM_Y_M` (forward) and `v_lat = −ω·LEVER_ARM_X_M` (lateral, **RIGHT +**, matching θ).
+Expanded, a stationary point's Doppler is `−v·cos θ + ω·LEVER_ARM_X_M·sin θ + ω·LEVER_ARM_Y_M·cos θ` — the
+lever-arm term `EgoEstimator._fit` subtracts. Rotate azimuths by `MOUNT_YAW_DEG` first.
 
 1. **Gate points**: range ≥ `EGO_MIN_RANGE_M`, finite snr; on slopes (|pitch| or |roll| > 8°) also drop
    points with |z| implausible — keep it simple: log, do not reject.
@@ -83,10 +85,15 @@ Model for a stationary point i at azimuth θ_i (sensor frame, boresight = +y as 
    (gate width shrinks to `a_max·dt` when inlier fraction < 0.5); inliers ≥ `EGO_MIN_POINTS` (6) and
    inlier fraction ≥ 0.4; **azimuth spread** of inliers (max−min of azimuth) ≥ 25° — below that the fit is
    `ambiguous`, hold last value.
+   The pitch/roll of the IMU sample are carried into `info()` with a `slope` flag (|pitch| or |roll| > 8°)
+   so a replay can tell a slope-induced bias from a calibration error — logged, never a rejection.
 6. **Radar yaw cross-check** (only when gyro ok, state MOVING, inliers ≥ 40 and spread ≥ 60°): run the
    2-parameter fit too; `yaw_rate_radar = v_lat / LEVER_ARM_X_M`; if `|yaw_rate_radar − ω_gyro| > 3 °/s`
    for 15 consecutive frames → `gyro_ok = False` flag in `ego_info` (alert code 130, see §7); never use
-   radar yaw as the operational yaw.
+   radar yaw as the operational yaw. **After a 130 the operational yaw is 0**: `info()["yaw_rate"]` reports the
+   yaw the fit actually used, so the tracker's de-rotation and the corridor curvature (§5) both fall back to
+   "straight" rather than following a gyro the system has just declared untrustworthy. The same holds for a
+   stale/uncalibrated sample — a yaw rate is used only while `gyro_ok` is true and the sample is fresh.
 7. `info()` adds: `state`, `bin`, `yaw_rate` (used, rad/s), `yaw_rate_radar`, `gyro_ok`, `gyro_bias_dps`,
    `time_offset_s`, `n_inliers`, `n_points`, `az_spread_deg`, `ambiguous`.
 
@@ -112,10 +119,18 @@ Tracker / background: `Tracker.step(..., yaw_rate=ω_gyro)` unchanged; `Backgrou
   (lateral offset ≈ κ·y²/2), else a straight box.
 - Static/moving label after compensation: keep `STATIC_DOPPLER_MPS` as the per-point threshold but derive
   it from the profile: `max(0.2 m/s, 1.2·bin)` per point (≈ 3σ of the ±½-bin floor), and a cluster-level
-  label at `0.8·bin` (median of ≥ 3 points); a tangential mover (person crossing) has zero Doppler and is
-  caught only by the tracker's position-derived speed.
+  label at `0.8·bin` (median of ≥ 3 points, `cluster_objects()[i]["is_static"]`, carried onto the track);
+  a tangential mover (person crossing) has zero Doppler and is
+  caught only by the tracker's position-derived speed. Compensation uses the **full** sensor-frame ego
+  velocity — forward `v` and the fit's lateral `vx = −ω·LEVER_ARM_X_M`, both rotated back by
+  `MOUNT_YAW_DEG` — not the forward scalar alone, or every turn labels the outer-azimuth clutter as moving.
+  (`points_to_detections`' forward-only `ego_speed_mps` feature for the LightGBM model stays as trained.)
 - Alerts (`alerts.py`): TTC tiers `TTC_WARN_S = 3.5`, `TTC_CRITICAL_S = 1.8` computed with the
-  ego-compensated closing speed of the track; when `state == STANDING` alerts are zone-occupancy only.
+  ego-compensated closing speed of the track; when `state == STANDING` **and the unclamped fit `raw` is
+  below `EGO_STATIONARY_MPS` = 0.15 m/s** alerts are zone-occupancy only — STANDING is a one-bin deadband
+  (0.27 m/s on hangar_v9), so the state alone must not silence the collision layer on a creeping tractor.
+  While `ttc_bound` (CREEPING, §4.3) the TTC tiers need a closing speed above `2·bin` and 122 TTC_CRITICAL
+  is held back to 121 — at 1..5 bins the track's radial speed is mostly quantisation noise.
   A static object inside the corridor is an obstacle by default (warn tier once confirmed by persistence
   ≥ 3 frames or by the camera), never a "background" drop.
 
@@ -145,7 +160,9 @@ alert-node handling (LEDs/buzzer, from `esp32/alert_node/alert_node.ino`) on the
 
 - 130 — IMU degraded (stale, uncalibrated, or radar/gyro yaw disagreement) — severity W.
 - 131 — ego estimate lost (UNKNOWN > 2 s while not STANDING) — severity W.
-- 140 stays: obstacle in corridor (now issued for static objects too).
+- 141 — obstacle in corridor (now issued for static objects too). NB: §7 originally said "140 stays", but in
+  this repository 140 was already `RADAR_SENSOR_STALE`, so the corridor obstacle is **141**
+  (`AlertCode.OBSTACLE_IN_CORRIDOR`); ALERTS.md and `tools/drills.md` T5 use 141.
 
 ## 8. Tests (`test_ego.py`, `tests/`)
 

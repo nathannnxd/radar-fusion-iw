@@ -56,8 +56,24 @@ ALERT CODES
       |                          |          | camera-only range estimate, or fused, whichever sees it
  111  | PROXIMITY_CRITICAL       | critical | as above, within the tighter PROXIMITY_CRITICAL_M
  120  | FAST_APPROACH            | warning  | an object's closing speed exceeds CLOSING_SPEED_ALERT_MPS
+ 121  | TTC_WARNING              | warning  | time-to-collision range/closing <= TTC_WARN_S (3.5 s) —
+      |                          |          | closing = the ego-compensated closing speed of the track
+      |                          |          | (the carrier's own speed included); not while STANDING
+ 122  | TTC_CRITICAL             | critical | as above, <= TTC_CRITICAL_S (1.8 s)
+ 130  | IMU_DEGRADED             | warning  | the gyro can't be trusted: link stale, uncalibrated, or the
+      |                          |          | radar/gyro yaw cross-check disagrees (ego["gyro_ok"] False;
+      |                          |          | only when an IMU link is configured) — obj_id=0
+ 131  | EGO_LOST                 | warning  | the carrier-speed estimate has been UNKNOWN for > EGO_LOST_S
+      |                          |          | (2 s) while not standing — corridor/TTC logic is blind — obj_id=0
  140  | RADAR_SENSOR_STALE       | critical | the radar hasn't produced a frame in RADAR_STALE_S —
       |                          |          | system is effectively blind on that sensor (obj_id=0)
+ 141  | OBSTACLE_IN_CORRIDOR     | warning  | a (static or moving) object inside the driving corridor,
+      |                          |          | confirmed by persistence (>= 3 frames) or by the camera —
+      |                          |          | never dropped as "background"; not while STANDING
+
+Ego-motion rules (EGO_MOTION.md §5, §7): evaluate(..., ego=out["ego"]) receives the radar pipeline's
+carrier-motion dict; while ego["state"] == "STANDING" the alerts are zone-occupancy only — 110/111
+(and the camera/radar state codes 100-103) still fire, 120/121/122/141 are suppressed.
 
 This is not an exhaustive list by design — see the module docstring above for how to add another
 condition: pick a code, a severity, and call self._emit(...) from evaluate().
@@ -114,7 +130,12 @@ class AlertCode:
     PROXIMITY_WARNING = 110
     PROXIMITY_CRITICAL = 111
     FAST_APPROACH = 120
+    TTC_WARNING = 121
+    TTC_CRITICAL = 122
+    IMU_DEGRADED = 130
+    EGO_LOST = 131
     RADAR_SENSOR_STALE = 140
+    OBSTACLE_IN_CORRIDOR = 141
 
 
 SEVERITY = {
@@ -125,10 +146,36 @@ SEVERITY = {
     AlertCode.PROXIMITY_WARNING: "W",
     AlertCode.PROXIMITY_CRITICAL: "C",
     AlertCode.FAST_APPROACH: "W",
+    AlertCode.TTC_WARNING: "W",
+    AlertCode.TTC_CRITICAL: "C",
+    AlertCode.IMU_DEGRADED: "W",
+    AlertCode.EGO_LOST: "W",
     AlertCode.RADAR_SENSOR_STALE: "C",
+    AlertCode.OBSTACLE_IN_CORRIDOR: "W",
 }
 
 CAMERA_DEGRADED_REASONS = {"haze / smoke / defocus", "over/under-exposed"}
+
+TTC_WARN_S = 3.5            # time-to-collision <= this — TTC_WARNING (configs.json TTC_WARN_S) — EGO_MOTION.md §5
+TTC_CRITICAL_S = 1.8        # ... <= this — TTC_CRITICAL (configs.json TTC_CRITICAL_S) — EGO_MOTION.md §5
+EGO_LOST_S = 2.0            # ego state UNKNOWN for longer than this while not standing — EGO_LOST — EGO_MOTION.md §7
+TTC_MIN_CLOSING_MPS = 0.3   # slower closing than this gives no TTC (avoids 1/0 and alerts on Doppler noise)
+EGO_STANDING_MAX_MPS = 0.15 # STANDING suppresses the collision layer only while the estimator's unclamped fit is
+                            # under this (= iwr1642_live.EGO_STATIONARY_MPS): the state itself is a one-bin deadband,
+                            # 0.27 m/s on hangar_v9, and a creeping tractor must keep its TTC/corridor alerts — §4.3/§5
+
+
+def ego_state(ego):
+    """Carrier-motion state name from the pipeline's ego dict: the estimator's "state" (STANDING / CREEPING /
+    MOVING / UNKNOWN, EGO_MOTION.md §4); an older dict without it is mapped from valid/moving."""
+    if not ego:
+        return "UNKNOWN"
+    st = ego.get("state")
+    if st:
+        return str(st).upper()
+    if not ego.get("valid"):
+        return "UNKNOWN"
+    return "MOVING" if ego.get("moving") else "STANDING"
 
 
 # ---------------------------------------------------------------- wire format
@@ -208,15 +255,21 @@ class AlertEngine:
     second."""
 
     def __init__(self, sinks, resend_s=2.0, radar_only_confirm_s=1.0,
-                 proximity_warn_m=3.0, proximity_critical_m=1.5, closing_speed_mps=2.0):
+                 proximity_warn_m=3.0, proximity_critical_m=1.5, closing_speed_mps=2.0,
+                 ttc_warn_s=TTC_WARN_S, ttc_critical_s=TTC_CRITICAL_S, ego_lost_s=EGO_LOST_S, imu_expected=False):
         self.sinks = sinks
         self.resend_s = resend_s
         self.radar_only_confirm_s = radar_only_confirm_s
         self.proximity_warn_m = proximity_warn_m
         self.proximity_critical_m = proximity_critical_m
         self.closing_speed_mps = closing_speed_mps
+        self.ttc_warn_s = ttc_warn_s
+        self.ttc_critical_s = ttc_critical_s
+        self.ego_lost_s = ego_lost_s
+        self.imu_expected = imu_expected   # an IMU link is configured: gyro_ok False is then a fault, not the default
         self._active = {}              # (code, obj_id) -> {"last_sent": t}
         self._radar_only_since = {}    # obj_id -> t first seen as radar-only, unconfirmed
+        self._ego_unknown_since = None # t the ego state became UNKNOWN (EGO_LOST after ego_lost_s)
 
     def close(self):
         for sink in self.sinks:
@@ -241,12 +294,39 @@ class AlertEngine:
         for sink in self.sinks:
             sink.send(line)
 
-    def evaluate(self, t, fused, cam_dets, cam, radar_stale):
+    def evaluate(self, t, fused, cam_dets, cam, radar_stale, ego=None):
         """t: clock() timestamp: fused/cam_dets/radar_stale: the same values already computed each
         frame in run_live() (s["fused"], dets, and stale) — this reuses them, it doesn't recompute
-        anything from scratch."""
+        anything from scratch. ego: the pipeline's carrier-motion dict for that radar frame
+        (out["ego"]: state / gyro_ok / v, EGO_MOTION.md §4) — None means "carrier state unknown":
+        no 130/131, nothing suppressed (TTC and corridor codes still follow the fused entries)."""
         # system health: is the radar sensor itself still alive?
         self._emit(t, AlertCode.RADAR_SENSOR_STALE, 0, radar_stale)
+
+        # carrier motion (EGO_MOTION.md §5, §7): while standing only zone occupancy matters — a person walking
+        # past a parked tractor must not trigger closing-speed/TTC/corridor alerts
+        st_ego = ego_state(ego)
+        # the state alone is not enough: STANDING is decided on a one-bin deadband and forces v := 0 exactly, so
+        # gate on the estimator's unclamped fit ('raw'; an older dict without it falls back to 'v') — EGO_MOTION.md §5
+        raw_v = (ego.get("raw", ego.get("v", 0.0)) if ego else 0.0) or 0.0
+        standing = ego is not None and st_ego == "STANDING" and abs(float(raw_v)) < EGO_STANDING_MAX_MPS
+        # CREEPING publishes ttc_bound (§4.3): at 1..5 bins a track's radial speed is mostly +-1 bin of quantisation
+        # noise, so the TTC closing floor rises to 2 bins there and 122 is held back to 121
+        ttc_bound = bool(ego.get("ttc_bound")) if ego else False
+        ttc_floor = max(TTC_MIN_CLOSING_MPS, 2.0 * float(ego.get("bin", 0.0) or 0.0)) if ttc_bound else TTC_MIN_CLOSING_MPS
+        if ego is not None:
+            # 130 only once the link has proven itself: gyro_ok is False before the first $EGOVEL sentence arrives
+            # and the Pi reaches its first radar frame before the ESP32 has finished booting (§7)
+            self._emit(t, AlertCode.IMU_DEGRADED, 0,
+                       self.imu_expected and ego.get("gyro_ok") is False and bool(ego.get("imu_seen", True)))
+            if st_ego == "UNKNOWN":
+                if self._ego_unknown_since is None:
+                    self._ego_unknown_since = t
+                lost = (t - self._ego_unknown_since) > self.ego_lost_s
+            else:
+                self._ego_unknown_since = None
+                lost = False
+            self._emit(t, AlertCode.EGO_LOST, 0, lost)
 
         seen_radar_only = set()
         for f in fused:
@@ -257,7 +337,11 @@ class AlertEngine:
             range_m = f.get("range_near_m")
             az = f.get("az_from_cam")
             speed = f.get("radial_mps")
-            closing = -speed if speed is not None else None
+            # closing speed of the track relative to the carrier: the radar's radial speed already contains the
+            # carrier's own motion (a post ahead closes at exactly the driving speed) — "ego-compensated" here means
+            # the carrier state gates it (standing -> no closing-speed alerts), not that ego motion is subtracted
+            closing = -speed if (speed is not None and not standing) else None
+            ttc = range_m / closing if (closing is not None and range_m is not None and closing >= ttc_floor) else None
 
             # 1) "detected by radar but not camera" — never confirmed by the camera at all. Gated by
             # a short confirm delay (radar_only_confirm_s) so a single-frame clutter blip upstream
@@ -292,6 +376,16 @@ class AlertEngine:
             # closing speed
             self._emit(t, AlertCode.FAST_APPROACH, obj_id,
                        closing is not None and closing >= self.closing_speed_mps, range_m, az, speed)
+
+            # time-to-collision tiers (EGO_MOTION.md §5) — the same value the overlay's NEAREST panel shows
+            self._emit(t, AlertCode.TTC_WARNING, obj_id, ttc is not None and ttc <= self.ttc_warn_s, range_m, az, speed)
+            self._emit(t, AlertCode.TTC_CRITICAL, obj_id,
+                       ttc is not None and ttc <= self.ttc_critical_s and not ttc_bound, range_m, az, speed)
+
+            # something in the driving corridor — static objects included, once fusion has confirmed them
+            # (persistence >= 3 frames or the camera); f["obstacle"] is computed in Fusion.on_radar()
+            self._emit(t, AlertCode.OBSTACLE_IN_CORRIDOR, obj_id,
+                       bool(f.get("obstacle")) and not standing and state != "out-of-frame", range_m, az, speed)
 
         # drop radar-only bookkeeping for any id no longer present at all this frame
         for obj_id in list(self._radar_only_since):

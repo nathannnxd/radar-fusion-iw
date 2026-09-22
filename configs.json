@@ -15,7 +15,7 @@
     "CAM_MJPG": 0,
     "DISPLAY_SCALE": 1.0,
     "CAMERA_INDEX": 0,
-    "RADAR_CONFIG": "radar_configs/config-16.09.26-12.43.cfg",
+    "RADAR_CONFIG": "radar_configs/hangar_v9.cfg",
     "ALERTS_ENABLED": 1,
     "ALERT_SERIAL_PORT": "",
     "ALERT_BAUD": 115200,
@@ -25,5 +25,13 @@
     "RADAR_ONLY_CONFIRM_S": 1.0,
     "ALERT_RESEND_S": 2.0,
     "EGO_SERIAL_PORT": "",
-    "EGO_BAUD": 115200
+    "EGO_BAUD": 115200,
+    "LEVER_ARM_X_M": 2.0,
+    "LEVER_ARM_Y_M": 0.0,
+    "MOUNT_YAW_DEG": 0.0,
+    "EGO_TIME_OFFSET_S": 0.0,
+    "EGO_GYRO_BIAS_DPS": 0.0,
+    "CORRIDOR_HALF_WIDTH_M": 1.5,
+    "TTC_WARN_S": 3.5,
+    "TTC_CRITICAL_S": 1.8
 }
